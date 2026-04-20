@@ -1,0 +1,36 @@
+id: multi-step-reasoning
+name: Multi-Step Reasoning
+description: |
+  For problems that require multiple reasoning steps (math, logic, planning),
+  the chain-of-thought must be internally consistent - each step follows from
+  the previous - and the final answer must follow from the chain. A correct
+  answer reached via a broken chain still counts as a partial failure.
+eval_dimensions:
+  - id: steps_are_consistent
+    description: Each reasoning step follows logically from the previous ones and the prompt.
+    judge_prompt_ref: multi-step-reasoning/steps_are_consistent.md
+    weight: 1.0
+  - id: conclusion_follows_from_chain
+    description: The final answer is a correct consequence of the provided chain.
+    judge_prompt_ref: multi-step-reasoning/conclusion_follows_from_chain.md
+    weight: 1.0
+  - id: answer_is_correct
+    description: The final answer is factually correct for the posed problem.
+    judge_prompt_ref: multi-step-reasoning/answer_is_correct.md
+    weight: 1.0
+slice_rules:
+  - type: semantic
+    value: Prompt requires multiple reasoning steps (math, logic, planning, multi-hop QA).
+eligible_methods:
+  - sft
+  - dpo
+  - grpo
+recipe_refs:
+  - sft-mlx-lora.yaml
+  - sft-unsloth-lora.yaml
+promotion_gate:
+  threshold: 0.05
+  max_other_regression: 0.02
+metadata:
+  area: reasoning
+  default_judge: llama3.2:3b-instruct

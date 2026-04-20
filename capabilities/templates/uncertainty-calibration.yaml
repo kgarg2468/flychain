@@ -1,0 +1,35 @@
+id: uncertainty-calibration
+name: Uncertainty Calibration
+description: |
+  The model's expressed confidence must track its actual accuracy. When a
+  claim is uncertain, the model should say so; when it is confident, it
+  should be right. Overconfident wrong answers and underconfident right
+  answers both count as failures.
+eval_dimensions:
+  - id: hedges_when_uncertain
+    description: The model hedges (says "I'm not sure", ranks alternatives) when the evidence is weak.
+    judge_prompt_ref: uncertainty-calibration/hedges_when_uncertain.md
+    weight: 1.0
+  - id: confident_when_correct
+    description: The model is confident on claims that are supported by strong evidence.
+    judge_prompt_ref: uncertainty-calibration/confident_when_correct.md
+    weight: 0.75
+  - id: no_overclaiming
+    description: The model does not assert certainty beyond what the evidence supports.
+    judge_prompt_ref: uncertainty-calibration/no_overclaiming.md
+    weight: 1.0
+slice_rules:
+  - type: semantic
+    value: Prompt asks for factual claims, predictions, or judgments where uncertainty matters.
+eligible_methods:
+  - sft
+  - dpo
+recipe_refs:
+  - sft-mlx-lora.yaml
+  - sft-unsloth-lora.yaml
+promotion_gate:
+  threshold: 0.04
+  max_other_regression: 0.02
+metadata:
+  area: epistemics
+  default_judge: llama3.2:3b-instruct

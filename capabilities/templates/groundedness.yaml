@@ -1,0 +1,37 @@
+id: groundedness
+name: Groundedness
+description: |
+  Model answers must be supported by the provided context. Every factual claim
+  in the output must be traceable to at least one span in the retrieved or
+  otherwise supplied context. Claims that are not grounded in the provided
+  context count as failures.
+eval_dimensions:
+  - id: all_claims_supported
+    description: Every factual claim in the output is supported by a span in the provided context.
+    judge_prompt_ref: groundedness/all_claims_supported.md
+    weight: 1.0
+  - id: no_hallucination
+    description: The output contains no fabricated facts that aren't present in the context.
+    judge_prompt_ref: groundedness/no_hallucination.md
+    weight: 1.0
+  - id: appropriate_refusal
+    description: When the context is insufficient, the model says so rather than guessing.
+    judge_prompt_ref: groundedness/appropriate_refusal.md
+    weight: 0.5
+slice_rules:
+  - type: tag
+    value: task=rag
+  - type: semantic
+    value: Prompt includes retrieved context passages that the answer should rely on.
+eligible_methods:
+  - sft
+  - dpo
+recipe_refs:
+  - sft-mlx-lora.yaml
+  - sft-unsloth-lora.yaml
+promotion_gate:
+  threshold: 0.05
+  max_other_regression: 0.02
+metadata:
+  area: factuality
+  default_judge: llama3.2:3b-instruct
