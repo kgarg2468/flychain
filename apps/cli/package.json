@@ -1,0 +1,31 @@
+{
+  "name": "@flychain/cli",
+  "version": "0.0.0",
+  "description": "FlyChain CLI - one-command repo instrumentation and project management",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "flychain": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "echo 'no lint yet'",
+    "test": "node --test --import tsx ./src/**/*.test.ts",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "fast-glob": "^3.3.3",
+    "picocolors": "^1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3"
+  }
+}
