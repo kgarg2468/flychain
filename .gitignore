@@ -1,0 +1,64 @@
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Node / pnpm
+node_modules/
+.pnpm-store/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log
+dist/
+.next/
+.turbo/
+out/
+coverage/
+
+# Python / uv
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.uv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Docker
+.docker/
+
+# Data / artifacts
+*.log
+data/
+artifacts/
+models/
+adapters/
+*.gguf
+*.safetensors
+*.bin
+
+# OS / misc
+Thumbs.db

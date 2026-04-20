@@ -1,0 +1,12 @@
+node_modules
+dist
+.next
+out
+.turbo
+coverage
+.venv
+__pycache__
+*.lock
+pnpm-lock.yaml
+uv.lock
+plan.md
