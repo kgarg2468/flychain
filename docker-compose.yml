@@ -1,0 +1,130 @@
+name: flychain
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.9
+    container_name: flychain-clickhouse
+    ports:
+      - '8123:8123' # HTTP
+      - '9000:9000' # native TCP
+    environment:
+      CLICKHOUSE_DB: flychain
+      CLICKHOUSE_USER: flychain
+      CLICKHOUSE_PASSWORD: flychain
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./infra/clickhouse/init:/docker-entrypoint-initdb.d:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:8123/ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: flychain-postgres
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_DB: flychain
+      POSTGRES_USER: flychain
+      POSTGRES_PASSWORD: flychain
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U flychain -d flychain']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: flychain-redis
+    ports:
+      - '6379:6379'
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: flychain-ollama
+    ports:
+      - '11434:11434'
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ['CMD-SHELL', 'ollama list || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  gateway:
+    build:
+      context: .
+      dockerfile: apps/gateway/Dockerfile
+    container_name: flychain-gateway
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      FLYCHAIN_CLICKHOUSE_URL: http://flychain:flychain@clickhouse:8123/flychain
+      FLYCHAIN_POSTGRES_URL: postgresql://flychain:flychain@postgres:5432/flychain
+      FLYCHAIN_OLLAMA_URL: http://ollama:11434
+      FLYCHAIN_ENV: local
+    ports:
+      - '8080:8080'
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: apps/orchestrator/Dockerfile
+    container_name: flychain-orchestrator
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      FLYCHAIN_CLICKHOUSE_URL: http://flychain:flychain@clickhouse:8123/flychain
+      FLYCHAIN_POSTGRES_URL: postgresql://flychain:flychain@postgres:5432/flychain
+      FLYCHAIN_REDIS_URL: redis://redis:6379/0
+      FLYCHAIN_OLLAMA_URL: http://ollama:11434
+      FLYCHAIN_ENV: local
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: apps/dashboard/Dockerfile
+    container_name: flychain-dashboard
+    depends_on:
+      - gateway
+    environment:
+      FLYCHAIN_GATEWAY_URL: http://gateway:8080
+      NEXT_PUBLIC_FLYCHAIN_GATEWAY_URL: http://localhost:8080
+    ports:
+      - '3000:3000'
+
+volumes:
+  clickhouse-data:
+  postgres-data:
+  redis-data:
+  ollama-data:

@@ -1,0 +1,70 @@
+[project]
+name = "flychain"
+version = "0.0.0"
+description = "FlyChain - open-source flywheel for making models better at specific capabilities"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "FlyChain Contributors" }]
+dependencies = [
+    "flychain-sdk",
+    "flychain-capability-compiler",
+    "flychain-gateway",
+    "flychain-orchestrator",
+]
+
+[tool.uv.workspace]
+members = [
+    "apps/gateway",
+    "apps/orchestrator",
+    "packages/sdk-py",
+    "packages/capability-compiler",
+]
+
+[tool.uv.sources]
+flychain-sdk = { workspace = true }
+flychain-capability-compiler = { workspace = true }
+flychain-gateway = { workspace = true }
+flychain-orchestrator = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6.9",
+    "pytest>=8.3.3",
+    "pytest-asyncio>=0.24.0",
+    "mypy>=1.11.2",
+    "httpx>=0.27.2",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["**/.venv", "**/node_modules", "**/dist", "**/.next"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501", # line length handled by formatter
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["apps", "packages"]
+python_files = ["test_*.py", "*_test.py"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
