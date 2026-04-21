@@ -29,6 +29,7 @@ class FakeLLM:
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[TestClient]:
     monkeypatch.setenv("FLYCHAIN_DATA_DIR", str(tmp_path / "flychain-data"))
+    monkeypatch.setenv("FLYCHAIN_CLICKHOUSE_URL", "http://localhost:1/flychain")
 
     def _fake_factory(*_args, **_kwargs):
         # Generous response budget so a request that matches multiple

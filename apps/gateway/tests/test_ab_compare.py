@@ -30,6 +30,7 @@ class FakeLLM:
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[TestClient]:
     monkeypatch.setenv("FLYCHAIN_DATA_DIR", str(tmp_path / "flychain-data"))
+    monkeypatch.setenv("FLYCHAIN_CLICKHOUSE_URL", "http://localhost:1/flychain")
     # Alternate bad/good scores so baseline < candidate.
     budget = [0.4, 0.5, 0.3, 0.9, 0.85, 0.8] * 8
 
