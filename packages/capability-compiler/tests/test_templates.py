@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from flychain_capability_compiler import list_templates, template_by_id
+from flychain_capability_compiler.templates import default_templates_dir
 
 
 def test_v1_templates_present() -> None:
@@ -36,3 +39,12 @@ def test_template_by_id_lookup() -> None:
     g = template_by_id("groundedness")
     assert g.name == "Groundedness"
     assert any(d.id == "all_claims_supported" for d in g.eval_dimensions)
+
+
+def test_default_templates_dir_respects_env_override(
+    monkeypatch, tmp_path: Path
+) -> None:
+    custom = tmp_path / "templates"
+    custom.mkdir()
+    monkeypatch.setenv("FLYCHAIN_TEMPLATES_DIR", str(custom))
+    assert default_templates_dir() == custom

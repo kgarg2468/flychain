@@ -7,6 +7,7 @@ of the 5-template library the dashboard's Recommended mode displays.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import yaml
@@ -16,12 +17,15 @@ from flychain_capability_compiler.schema import CapabilitySpec
 
 def default_templates_dir() -> Path:
     """Return the path to the shipped ``capabilities/templates`` directory."""
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent / "capabilities" / "templates"
-        if candidate.is_dir():
-            return candidate
-    raise FileNotFoundError("capabilities/templates directory not found")
+    override = os.environ.get("FLYCHAIN_TEMPLATES_DIR")
+    if override:
+        return Path(override)
+
+    packaged = Path(__file__).resolve().parent / "_assets" / "templates"
+    if packaged.is_dir():
+        return packaged
+
+    raise FileNotFoundError("packaged templates directory not found; set FLYCHAIN_TEMPLATES_DIR")
 
 
 def load_template(path: str | Path) -> CapabilitySpec:

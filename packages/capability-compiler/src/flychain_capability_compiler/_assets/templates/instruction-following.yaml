@@ -1,0 +1,35 @@
+id: instruction-following
+name: Instruction Following
+description: |
+  Model outputs must comply with every explicit user constraint: requested
+  format (JSON schema, Markdown structure, etc.), language, length, tone,
+  forbidden content, and ordering. A single ignored constraint is a failure
+  even if the answer is otherwise correct.
+eval_dimensions:
+  - id: format_compliance
+    description: Output matches the requested format (JSON schema, headings, list, etc.).
+    judge_prompt_ref: instruction-following/format_compliance.md
+    weight: 1.0
+  - id: constraint_coverage
+    description: All explicit constraints (length, language, tone, forbidden content) are satisfied.
+    judge_prompt_ref: instruction-following/constraint_coverage.md
+    weight: 1.0
+  - id: no_extra_fields
+    description: The output does not add content, fields, or sections the user did not ask for.
+    judge_prompt_ref: instruction-following/no_extra_fields.md
+    weight: 0.5
+slice_rules:
+  - type: semantic
+    value: Prompt contains explicit formatting, length, or style constraints.
+eligible_methods:
+  - sft
+  - dpo
+recipe_refs:
+  - sft-mlx-lora.yaml
+  - sft-unsloth-lora.yaml
+promotion_gate:
+  threshold: 0.05
+  max_other_regression: 0.02
+metadata:
+  area: control
+  default_judge: llama3.2:3b

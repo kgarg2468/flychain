@@ -1,0 +1,35 @@
+id: code-correctness
+name: Code Correctness
+description: |
+  Generated code must parse, type-check where applicable, and satisfy any
+  explicit behavioral contract (docstring, tests, examples). Code that looks
+  plausible but fails to compile or silently returns wrong results counts as
+  a failure.
+eval_dimensions:
+  - id: parses_and_compiles
+    description: The code parses cleanly for its target language (Python, TS, etc.).
+    judge_prompt_ref: code-correctness/parses_and_compiles.md
+    weight: 1.0
+  - id: behavior_matches_spec
+    description: The code behaves as described in the prompt, docstring, or provided tests.
+    judge_prompt_ref: code-correctness/behavior_matches_spec.md
+    weight: 1.0
+  - id: no_unreachable_or_dead
+    description: The code has no obvious dead/unreachable branches or logic errors.
+    judge_prompt_ref: code-correctness/no_unreachable_or_dead.md
+    weight: 0.5
+slice_rules:
+  - type: semantic
+    value: Prompt asks for code generation, completion, or modification.
+eligible_methods:
+  - sft
+  - dpo
+recipe_refs:
+  - sft-mlx-lora.yaml
+  - sft-unsloth-lora.yaml
+promotion_gate:
+  threshold: 0.05
+  max_other_regression: 0.02
+metadata:
+  area: code
+  default_judge: llama3.2:3b
