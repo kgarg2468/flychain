@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -53,6 +54,7 @@ from flychain_gateway.schemas import (
     FeedbackRequest,
     TraceRecord,
 )
+from flychain_gateway.settings_store import LocalSettings, SettingsStore
 from flychain_gateway.trace_store import TraceStore
 from flychain_gateway.training_store import (
     AdapterPointerStore,
@@ -89,8 +91,19 @@ def _extract_headers(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    get_settings.cache_clear()
     settings: Settings = get_settings()
+    if settings.data_dir:
+        os.environ["FLYCHAIN_DATA_DIR"] = settings.data_dir
+    if settings.models_yaml:
+        os.environ["FLYCHAIN_MODELS_YAML"] = settings.models_yaml
+    if settings.templates_dir:
+        os.environ["FLYCHAIN_TEMPLATES_DIR"] = settings.templates_dir
+    if settings.recipes_dir:
+        os.environ["FLYCHAIN_RECIPES_DIR"] = settings.recipes_dir
+    os.environ.setdefault("FLYCHAIN_EMBEDDING_MODEL", settings.embedding_model)
     setup_tracing(service_name="flychain-gateway", otlp_endpoint=settings.otlp_endpoint)
+    get_registry.cache_clear()
     registry: ModelRegistry = get_registry()
     store = TraceStore(settings.clickhouse_url)
     store.connect()
@@ -102,6 +115,7 @@ async def lifespan(app: FastAPI):
     dataset_store = DatasetStore(data_root / "datasets")
     training_run_store = TrainingRunStore(data_root / "runs")
     adapter_pointer_store = AdapterPointerStore(data_root / "pointers")
+    local_settings_store = SettingsStore(data_root / "settings.json")
 
     app.state.settings = settings
     app.state.registry = registry
@@ -112,6 +126,7 @@ async def lifespan(app: FastAPI):
     app.state.dataset_store = dataset_store
     app.state.training_run_store = training_run_store
     app.state.adapter_pointer_store = adapter_pointer_store
+    app.state.local_settings_store = local_settings_store
 
     try:
         yield
@@ -129,6 +144,10 @@ def create_app() -> FastAPI:
             "FlyChain capability-improvement flywheel."
         ),
     )
+
+    def local_settings() -> LocalSettings:
+        store: SettingsStore = app.state.local_settings_store
+        return store.load()
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -484,7 +503,8 @@ def create_app() -> FastAPI:
         This lives on the gateway (rather than the orchestrator) so the
         dashboard can stream it from a single origin.
         """
-        compiler = CapabilityCompiler(llm=auto_client())
+        runtime = local_settings()
+        compiler = CapabilityCompiler(llm=auto_client(ollama_model=runtime.judge_model))
         questions = await compiler.propose_questions(body.description)
         return {
             "questions": [{"id": q.id, "question": q.question} for q in questions],
@@ -499,7 +519,8 @@ def create_app() -> FastAPI:
         The returned spec is not persisted - the client reviews it and then
         POSTs to /v1/capabilities if they want to save it.
         """
-        compiler = CapabilityCompiler(llm=auto_client())
+        runtime = local_settings()
+        compiler = CapabilityCompiler(llm=auto_client(ollama_model=runtime.judge_model))
         spec = await compiler.compile(body.description, body.answers or {})
         return {
             "spec": spec.model_dump(mode="json"),
@@ -532,7 +553,8 @@ def create_app() -> FastAPI:
         else:
             specs = capability_store.list()
 
-        engine = EvalEngine(llm=auto_client())
+        runtime = local_settings()
+        engine = EvalEngine(llm=auto_client(ollama_model=runtime.judge_model))
         trace = TraceData(
             trace_id=body.trace_id,
             project_id=body.project_id or "default",
@@ -566,17 +588,71 @@ def create_app() -> FastAPI:
     @app.get("/debug/traces")
     def debug_traces() -> list[dict[str, Any]]:
         store: TraceStore = app.state.trace_store
-        return store.buffered_traces()
+        traces, _total = store.list_traces(limit=500, offset=0)
+        return traces
 
     @app.get("/debug/feedback")
     def debug_feedback() -> list[dict[str, Any]]:
         store: TraceStore = app.state.trace_store
-        return store.buffered_feedback()
+        return store.list_feedback()
 
     @app.get("/debug/eval-scores")
     def debug_eval_scores() -> list[dict[str, Any]]:
         store: TraceStore = app.state.trace_store
-        return store.buffered_eval_scores()
+        return store.list_eval_scores()
+
+    @app.get("/v1/traces")
+    def traces_list(
+        project_id: str | None = None,
+        capability_id: str | None = None,
+        status: str | None = None,
+        provider: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        store: TraceStore = app.state.trace_store
+        traces, total = store.list_traces(
+            project_id=project_id,
+            capability_id=capability_id,
+            status=status,
+            provider=provider,
+            limit=limit,
+            offset=offset,
+        )
+        return {"traces": traces, "total": total, "limit": limit, "offset": offset}
+
+    @app.get("/v1/settings")
+    def settings_get() -> dict[str, Any]:
+        runtime = local_settings()
+        settings: Settings = app.state.settings
+        return {
+            "settings": runtime.model_dump(mode="json"),
+            "openai_configured": bool(settings.openai_api_key or os.environ.get("OPENAI_API_KEY")),
+            "anthropic_configured": bool(
+                settings.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
+            ),
+            "runtime": {
+                "env": settings.env,
+                "ollama_url": settings.ollama_url,
+                "clickhouse_url": settings.clickhouse_url,
+                "postgres_url": settings.postgres_url,
+                "redis_url": settings.redis_url,
+                "data_dir": str(default_data_dir()),
+            },
+        }
+
+    @app.put("/v1/settings")
+    def settings_put(body: UpdateSettingsRequest) -> dict[str, Any]:
+        store: SettingsStore = app.state.local_settings_store
+        current = store.load()
+        settings = store.save(
+            current.model_copy(update=body.model_dump(exclude_none=True))
+        )
+        return {
+            "settings": settings.model_dump(mode="json"),
+            "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
+            "anthropic_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        }
 
     @app.post("/v1/capabilities/{capability_id}/cluster-run")
     async def capabilities_cluster_run(
@@ -608,11 +684,12 @@ def create_app() -> FastAPI:
             for ft in body.failures
         ]
 
+        runtime = local_settings()
         result = await cluster_failures(
             capability=spec,
             failures=failures,
-            embedder=auto_embedder(),
-            llm=auto_client() if body.summarize else None,
+            embedder=auto_embedder(ollama_model=runtime.embedding_model),
+            llm=auto_client(ollama_model=runtime.judge_model) if body.summarize else None,
             min_cluster_size=body.min_cluster_size,
             summarize=body.summarize,
         )
@@ -665,19 +742,21 @@ def create_app() -> FastAPI:
 
         method = body.method.lower()
         if method == "sft":
+            runtime = local_settings()
             rows = await synthesize_sft_dataset(
                 capability=spec,
                 cluster=cluster,
                 failures=failures,
-                llm=auto_client() if body.generate_missing else None,
+                llm=auto_client(ollama_model=runtime.judge_model) if body.generate_missing else None,
                 generate_missing=body.generate_missing,
             )
         elif method == "dpo":
+            runtime = local_settings()
             rows = await synthesize_dpo_dataset(
                 capability=spec,
                 cluster=cluster,
                 failures=failures,
-                llm=auto_client() if body.generate_missing else None,
+                llm=auto_client(ollama_model=runtime.judge_model) if body.generate_missing else None,
                 generate_missing=body.generate_missing,
             )
         else:
@@ -929,7 +1008,8 @@ def create_app() -> FastAPI:
         except CapabilityNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"no such capability: {exc}") from exc
 
-        engine = EvalEngine(llm=auto_client())
+        runtime = local_settings()
+        engine = EvalEngine(llm=auto_client(ollama_model=runtime.judge_model))
         baseline_scores = []
         candidate_scores = []
         for row in body.replay:
@@ -984,9 +1064,7 @@ def create_app() -> FastAPI:
         except CapabilityNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"no such capability: {exc}") from exc
 
-        rows = [
-            r for r in trace_store.buffered_eval_scores() if r["capability_id"] == capability_id
-        ]
+        rows = trace_store.list_eval_scores(capability_id=capability_id)
         if not rows:
             return {
                 "capability_id": capability_id,
@@ -1019,7 +1097,7 @@ def create_app() -> FastAPI:
 
         return {
             "capability_id": capability_id,
-            "sample_count": len(rows),
+            "sample_count": len({r["trace_id"] for r in rows}),
             "aggregate_score": weighted_sum / total_w if total_w else None,
             "dimensions": dim_summaries,
         }
@@ -1110,6 +1188,15 @@ class ApplyGateRequest(BaseModel):
 class ActivateRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     run_id: str
+
+
+class UpdateSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    judge_model: str | None = None
+    embedding_model: str | None = None
+    min_cluster_size: int | None = None
+    auto_eval_new_traces: bool | None = None
+    auto_cluster_failures: bool | None = None
 
 
 class ReplayRow(BaseModel):
