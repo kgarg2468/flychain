@@ -44,12 +44,10 @@ class ModelRegistry:
         override = os.environ.get("FLYCHAIN_MODELS_YAML")
         if override:
             return Path(override)
-        here = Path(__file__).resolve()
-        for parent in here.parents:
-            candidate = parent / "models.yaml"
-            if candidate.exists():
-                return candidate
-        raise FileNotFoundError("models.yaml not found; set FLYCHAIN_MODELS_YAML")
+        packaged = Path(__file__).resolve().parent / "_assets" / "models.yaml"
+        if packaged.exists():
+            return packaged
+        raise FileNotFoundError("packaged models.yaml not found; set FLYCHAIN_MODELS_YAML")
 
     def providers(self) -> list[str]:
         return list(self._providers.keys())
