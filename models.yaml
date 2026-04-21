@@ -23,6 +23,9 @@ providers:
       - id: llama3.2:1b-instruct
         prompt_usd_per_1k: 0.0
         completion_usd_per_1k: 0.0
+      - id: llama3.2:3b
+        prompt_usd_per_1k: 0.0
+        completion_usd_per_1k: 0.0
       - id: llama3.2:3b-instruct
         prompt_usd_per_1k: 0.0
         completion_usd_per_1k: 0.0
