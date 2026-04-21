@@ -77,7 +77,7 @@ class HashEmbedder:
         return out
 
 
-def auto_embedder(*, prefer: str | None = None) -> Embedder:
+def auto_embedder(*, prefer: str | None = None, ollama_model: str | None = None) -> Embedder:
     """Pick an embedder based on environment.
 
     Precedence when ``prefer`` is None:
@@ -90,4 +90,4 @@ def auto_embedder(*, prefer: str | None = None) -> Embedder:
     if preferred == "hash":
         return HashEmbedder()
     # In v1 local-only mode we don't ship a paid embedding path - Ollama first.
-    return OllamaEmbedder()
+    return OllamaEmbedder(model=ollama_model or os.environ.get("FLYCHAIN_EMBEDDING_MODEL", "nomic-embed-text"))

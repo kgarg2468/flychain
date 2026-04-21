@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     ollama_url: str = "http://localhost:11434"
     gateway_url: str = "http://localhost:8080"
-    judge_model: str = "llama3.2:3b-instruct"
+    judge_model: str = "llama3.2:3b"
     embedding_model: str = "nomic-embed-text"
 
 
