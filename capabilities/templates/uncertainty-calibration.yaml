@@ -32,4 +32,4 @@ promotion_gate:
   max_other_regression: 0.02
 metadata:
   area: epistemics
-  default_judge: llama3.2:3b-instruct
+  default_judge: llama3.2:3b
