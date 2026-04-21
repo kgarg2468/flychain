@@ -9,6 +9,7 @@ Recipes live in ``recipes/*.yaml`` and are forkable.
 
 from __future__ import annotations
 
+import os
 from enum import StrEnum
 from pathlib import Path
 
@@ -69,12 +70,15 @@ class Recipe(BaseModel):
 
 
 def default_recipes_dir() -> Path:
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent / "recipes"
-        if candidate.is_dir():
-            return candidate
-    raise FileNotFoundError("recipes/ directory not found")
+    override = os.environ.get("FLYCHAIN_RECIPES_DIR")
+    if override:
+        return Path(override)
+
+    packaged = Path(__file__).resolve().parent / "_assets" / "recipes"
+    if packaged.is_dir():
+        return packaged
+
+    raise FileNotFoundError("packaged recipes directory not found; set FLYCHAIN_RECIPES_DIR")
 
 
 def load_recipe(path: str | Path) -> Recipe:

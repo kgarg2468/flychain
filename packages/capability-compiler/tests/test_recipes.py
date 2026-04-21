@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import textwrap
+from pathlib import Path
 
 import pytest
 from flychain_capability_compiler import (
@@ -13,6 +14,7 @@ from flychain_capability_compiler import (
     load_recipe,
     recipe_by_id,
 )
+from flychain_capability_compiler.recipe import default_recipes_dir
 from pydantic import ValidationError
 
 
@@ -67,3 +69,10 @@ def test_recipe_defaults() -> None:
     assert r.method == RecipeMethod.SFT
     assert r.backend == RecipeBackend.MLX_LM
     assert r.hyperparams.lora_r == 8
+
+
+def test_default_recipes_dir_respects_env_override(monkeypatch, tmp_path: Path) -> None:
+    custom = tmp_path / "recipes"
+    custom.mkdir()
+    monkeypatch.setenv("FLYCHAIN_RECIPES_DIR", str(custom))
+    assert default_recipes_dir() == custom

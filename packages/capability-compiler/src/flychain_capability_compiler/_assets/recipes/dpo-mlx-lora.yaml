@@ -1,0 +1,20 @@
+id: dpo-mlx-lora
+description: |
+  DPO LoRA recipe for Apple Silicon. Takes (prompt, chosen, rejected) rows
+  (typically synthesized from /v1/feedback corrections + judge pairs) and
+  updates a LoRA adapter via `mlx_lm.dpo`.
+base_model: meta-llama/Llama-3.2-3B-Instruct
+method: dpo
+backend: mlx-lm
+hyperparams:
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  learning_rate: 1.0e-4
+  epochs: 1
+  batch_size: 2
+  max_seq_len: 2048
+  warmup_steps: 10
+  seed: 42
+promotion_threshold: 0.04
+max_other_regression: 0.02

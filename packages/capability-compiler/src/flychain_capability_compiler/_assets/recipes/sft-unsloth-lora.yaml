@@ -1,0 +1,20 @@
+id: sft-unsloth-lora
+description: |
+  SFT LoRA recipe for CUDA Linux hosts. Wraps the `unsloth` trainer and
+  produces the same merged-adapter + GGUF output shape as the MLX recipe so
+  downstream serving is identical.
+base_model: meta-llama/Llama-3.2-3B-Instruct
+method: sft
+backend: unsloth
+hyperparams:
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  learning_rate: 2.0e-4
+  epochs: 3
+  batch_size: 2
+  max_seq_len: 2048
+  warmup_steps: 10
+  seed: 42
+promotion_threshold: 0.05
+max_other_regression: 0.02
