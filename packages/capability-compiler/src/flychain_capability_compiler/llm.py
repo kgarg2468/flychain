@@ -25,7 +25,7 @@ class LLMClient(Protocol):
 class OllamaClient:
     provider = "local-ollama"
 
-    def __init__(self, base_url: str | None = None, model: str = "llama3.2:3b-instruct") -> None:
+    def __init__(self, base_url: str | None = None, model: str = "llama3.2:3b") -> None:
         self.base_url = (
             base_url or os.environ.get("FLYCHAIN_OLLAMA_URL", "http://localhost:11434")
         ).rstrip("/")
@@ -127,7 +127,7 @@ def auto_client(
     *,
     prefer: str | None = None,
     ollama_url: str | None = None,
-    ollama_model: str = "llama3.2:3b-instruct",
+    ollama_model: str = "llama3.2:3b",
 ) -> LLMClient:
     """Pick an LLM client based on available keys.
 
