@@ -49,9 +49,15 @@ uv sync
 # bring up the local stack
 docker compose up -d
 
+# pull the local judge + embedding models FlyChain expects
+pnpm -F @flychain/cli build
+node ./apps/cli/dist/index.js bootstrap local-models
+
 # open the dashboard
 open http://localhost:3000
 ```
+
+FlyChain persists local state under `./.flychain-data/`, which is bind-mounted into the gateway and orchestrator containers so capabilities, datasets, runs, pointers, and local settings stay shared across the stack.
 
 ## Status
 
