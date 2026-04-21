@@ -34,6 +34,7 @@ def _trace(tid: str, text: str, corrected: str | None = None) -> FailedTrace:
         project_id="p",
         input=f"explain {text}",
         output=f"bad answer about {text}",
+        context=f"context for {text}",
         corrected_response=corrected,
     )
 
@@ -129,6 +130,50 @@ async def test_cluster_failures_empty_pool() -> None:
         llm=FakeLLM([]),
     )
     assert result.clusters == []
+    assert result.noise_trace_ids == []
+
+
+def test_failed_trace_signature_includes_context_and_correction() -> None:
+    trace = FailedTrace(
+        trace_id="t1",
+        project_id="p",
+        input="What is the refund window?",
+        output="Refunds are 90 days.",
+        context="Policy: refunds are available for 30 days.",
+        corrected_response="Refunds are available for 30 days.",
+    )
+    signature = trace.signature()
+    assert "CONTEXT" in signature
+    assert "IDEAL" in signature
+    assert "30 days" in signature
+
+
+@pytest.mark.asyncio
+async def test_cluster_failures_falls_back_when_hdbscan_returns_all_noise() -> None:
+    spec = _spec()
+    matrix = np.array(
+        [
+            [0.0, 0.0],
+            [10.0, 10.0],
+            [20.0, 20.0],
+            [30.0, 30.0],
+        ],
+        dtype=np.float32,
+    )
+    failures = [_trace(f"t{i}", f"case-{i}", corrected=f"ideal-{i}") for i in range(4)]
+    fake_llm = FakeLLM([json.dumps({"label": "repeated policy mistakes"})])
+
+    result = await cluster_failures(
+        capability=spec,
+        failures=failures,
+        embedder=FixedEmbedder(matrix),
+        llm=fake_llm,
+        min_cluster_size=2,
+    )
+
+    assert len(result.clusters) == 1
+    assert result.clusters[0].label == "repeated policy mistakes"
+    assert result.clusters[0].size == 4
     assert result.noise_trace_ids == []
 
 

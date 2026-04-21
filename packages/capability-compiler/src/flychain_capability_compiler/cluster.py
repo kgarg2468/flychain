@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -45,7 +46,15 @@ class FailedTrace:
 
     def signature(self) -> str:
         """Text used for embedding + clustering."""
-        return f"PROMPT:\n{self.input.strip()}\n\nOUTPUT:\n{self.output.strip()}"
+        parts = [
+            ("PROMPT", _normalize_text(self.input)),
+            ("OUTPUT", _normalize_text(self.output)),
+        ]
+        if self.context.strip():
+            parts.append(("CONTEXT", _normalize_text(self.context)))
+        if self.corrected_response and self.corrected_response.strip():
+            parts.append(("IDEAL", _normalize_text(self.corrected_response)))
+        return "\n\n".join(f"{label}:\n{text}" for label, text in parts if text)
 
 
 @dataclass(slots=True)
@@ -89,6 +98,10 @@ class SynthesizedDataset:
 def _cluster_label(trace_ids: list[str], label: str) -> str:
     # Stable label prefix combining the user-facing label with size hint.
     return label
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
 
 
 async def cluster_failures(
@@ -138,6 +151,24 @@ async def cluster_failures(
 
     clusters: list[Cluster] = []
     labeller = llm if llm is not None else (auto_client() if summarize else None)
+
+    if not buckets and len(failures) >= min_cluster_size:
+        summary = "needs review"
+        if labeller is not None and summarize:
+            summary = await _summarize(labeller, capability, failures)
+        return ClusteringResult(
+            capability_id=capability.id,
+            clusters=[
+                Cluster(
+                    id=f"{capability.id}-c0",
+                    capability_id=capability.id,
+                    label=summary,
+                    size=len(failures),
+                    trace_ids=[f.trace_id for f in failures],
+                )
+            ],
+            noise_trace_ids=[],
+        )
 
     for lab, idxs in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
         trace_ids = [failures[i].trace_id for i in idxs]
