@@ -1,11 +1,13 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 
+import { CapabilityControls } from './controls';
 import {
   gateway,
   type ActiveAdapter,
   type ClustersResponse,
   type DatasetEntry,
+  type RecipeRow,
   type Scorecard,
   type TrainingRunRow,
 } from '@/lib/gateway';
@@ -58,11 +60,28 @@ export default async function CapabilityPage({ params }: Params) {
     activeAdapter = null;
   }
 
+  let recipes: RecipeRow[] = [];
+  try {
+    recipes = (await gateway.recipes()).recipes;
+  } catch {
+    recipes = [];
+  }
+
   return (
-    <main className="mx-auto flex min-h-screen max-w-4xl flex-col gap-8 px-6 py-12">
-      <Link href="/" className="text-sm text-neutral-500 hover:underline">
-        ← Back to workspace
-      </Link>
+    <main className="mx-auto flex min-h-screen max-w-5xl flex-col gap-8 px-6 py-12">
+      <div className="flex items-center justify-between gap-4">
+        <Link href="/" className="text-sm text-neutral-500 hover:underline">
+          ← Back to workspace
+        </Link>
+        <div className="flex gap-3 text-sm text-neutral-500">
+          <Link href="/traces" className="hover:text-neutral-900 hover:underline">
+            Trace explorer
+          </Link>
+          <Link href="/settings" className="hover:text-neutral-900 hover:underline">
+            Settings
+          </Link>
+        </div>
+      </div>
 
       <header className="flex flex-col gap-2">
         <span className="font-mono text-xs text-neutral-500">{spec.id}</span>
@@ -325,6 +344,14 @@ export default async function CapabilityPage({ params }: Params) {
           </ul>
         )}
       </Section>
+
+      <CapabilityControls
+        capabilityId={id}
+        clusters={clusters?.clusters ?? []}
+        datasets={datasets}
+        runs={runs}
+        recipes={recipes}
+      />
     </main>
   );
 }

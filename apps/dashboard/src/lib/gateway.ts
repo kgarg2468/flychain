@@ -67,6 +67,32 @@ export interface ClustersResponse {
   noise_trace_ids: string[];
 }
 
+export interface TraceRow {
+  trace_id: string;
+  project_id: string;
+  provider: string;
+  model: string;
+  method: string;
+  request: Record<string, unknown>;
+  response: Record<string, unknown>;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  latency_ms: number;
+  status: string;
+  error: string;
+  tags: Record<string, string>;
+  ts: string;
+}
+
+export interface TraceListResponse {
+  traces: TraceRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface DatasetEntry {
   id: string;
   capability_id: string;
@@ -101,6 +127,38 @@ export interface ActiveAdapter {
   } | null;
 }
 
+export interface RecipeRow {
+  id: string;
+  base_model: string;
+  method: string;
+  backend: string;
+  description: string;
+  promotion_threshold: number;
+  max_other_regression: number;
+}
+
+export interface RuntimeSettings {
+  judge_model: string;
+  embedding_model: string;
+  min_cluster_size: number;
+  auto_eval_new_traces: boolean;
+  auto_cluster_failures: boolean;
+}
+
+export interface SettingsPayload {
+  settings: RuntimeSettings;
+  openai_configured: boolean;
+  anthropic_configured: boolean;
+  runtime?: {
+    env: string;
+    ollama_url: string;
+    clickhouse_url: string;
+    postgres_url: string;
+    redis_url: string;
+    data_dir: string;
+  };
+}
+
 function gatewayBaseUrl(): string {
   const fromServer = process.env.FLYCHAIN_GATEWAY_URL;
   if (fromServer) return fromServer;
@@ -118,6 +176,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     throw new Error(`gateway ${res.status}: ${await res.text()}`);
+  }
+  if (res.status === 204) {
+    return undefined as T;
   }
   return (await res.json()) as T;
 }
@@ -171,19 +232,161 @@ export const gateway = {
   async scorecard(id: string): Promise<Scorecard> {
     return request<Scorecard>(`/v1/capabilities/${encodeURIComponent(id)}/scorecard`);
   },
+  async traces(args?: {
+    project_id?: string;
+    capability_id?: string;
+    status?: string;
+    provider?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<TraceListResponse> {
+    const search = new URLSearchParams();
+    if (args?.project_id) search.set('project_id', args.project_id);
+    if (args?.capability_id) search.set('capability_id', args.capability_id);
+    if (args?.status) search.set('status', args.status);
+    if (args?.provider) search.set('provider', args.provider);
+    if (args?.limit !== undefined) search.set('limit', String(args.limit));
+    if (args?.offset !== undefined) search.set('offset', String(args.offset));
+    const qs = search.toString();
+    return request<TraceListResponse>(`/v1/traces${qs ? `?${qs}` : ''}`);
+  },
   async clusters(id: string): Promise<ClustersResponse> {
     return request<ClustersResponse>(`/v1/capabilities/${encodeURIComponent(id)}/clusters`);
+  },
+  async clusterRun(
+    id: string,
+    args: {
+      failures: Array<{
+        trace_id: string;
+        project_id?: string;
+        input: string;
+        output: string;
+        context?: string;
+        corrected_response?: string;
+        tags?: Record<string, string>;
+      }>;
+      min_cluster_size?: number;
+      summarize?: boolean;
+    },
+  ): Promise<ClustersResponse> {
+    return request<ClustersResponse>(`/v1/capabilities/${encodeURIComponent(id)}/cluster-run`, {
+      method: 'POST',
+      body: JSON.stringify(args),
+    });
   },
   async datasets(id: string): Promise<{ datasets: DatasetEntry[] }> {
     return request<{ datasets: DatasetEntry[] }>(
       `/v1/capabilities/${encodeURIComponent(id)}/datasets`,
     );
   },
+  async synthesizeDataset(
+    id: string,
+    args: {
+      cluster: {
+        id: string;
+        capability_id: string;
+        label: string;
+        size: number;
+        trace_ids: string[];
+      };
+      failures: Array<{
+        trace_id: string;
+        project_id?: string;
+        input: string;
+        output: string;
+        context?: string;
+        corrected_response?: string;
+        tags?: Record<string, string>;
+      }>;
+      method: string;
+      generate_missing?: boolean;
+    },
+  ): Promise<DatasetEntry> {
+    return request<DatasetEntry>(
+      `/v1/capabilities/${encodeURIComponent(id)}/synthesize-dataset`,
+      {
+        method: 'POST',
+        body: JSON.stringify(args),
+      },
+    );
+  },
+  async recipes(): Promise<{ recipes: RecipeRow[] }> {
+    return request<{ recipes: RecipeRow[] }>('/v1/recipes');
+  },
   async trainingRuns(capabilityId?: string): Promise<{ runs: TrainingRunRow[] }> {
     const qs = capabilityId ? `?capability_id=${encodeURIComponent(capabilityId)}` : '';
     return request<{ runs: TrainingRunRow[] }>(`/v1/training-runs${qs}`);
   },
+  async createTrainingRun(args: {
+    capability_id: string;
+    recipe_id: string;
+    dataset_id: string;
+    baseline?: Record<string, number>;
+    allow_backend_fallback?: boolean;
+  }): Promise<TrainingRunRow> {
+    return request<TrainingRunRow>('/v1/training-runs', {
+      method: 'POST',
+      body: JSON.stringify(args),
+    });
+  },
+  async abCompare(
+    id: string,
+    args: {
+      replay: Array<{
+        trace_id: string;
+        project_id?: string;
+        input: string;
+        context?: string;
+        baseline_output: string;
+        candidate_output: string;
+        tags?: Record<string, string>;
+      }>;
+    },
+  ): Promise<{
+    capability_id: string;
+    sample_count: number;
+    baseline: { aggregate_score: number; scores: Array<Record<string, unknown>> };
+    candidate: { aggregate_score: number; scores: Array<Record<string, unknown>> };
+    delta: number;
+  }> {
+    return request(`/v1/capabilities/${encodeURIComponent(id)}/ab-compare`, {
+      method: 'POST',
+      body: JSON.stringify(args),
+    });
+  },
+  async applyGate(
+    runId: string,
+    args: { candidate: Record<string, number>; baseline?: Record<string, number> },
+  ): Promise<{
+    run: TrainingRunRow;
+    verdict: Record<string, unknown>;
+  }> {
+    return request(`/v1/training-runs/${encodeURIComponent(runId)}/apply-gate`, {
+      method: 'POST',
+      body: JSON.stringify(args),
+    });
+  },
   async activeAdapter(id: string): Promise<ActiveAdapter> {
     return request<ActiveAdapter>(`/v1/capabilities/${encodeURIComponent(id)}/active-adapter`);
+  },
+  async activateAdapter(id: string, runId: string): Promise<{ active_run_id: string }> {
+    return request(`/v1/capabilities/${encodeURIComponent(id)}/active-adapter`, {
+      method: 'POST',
+      body: JSON.stringify({ run_id: runId }),
+    });
+  },
+  async deactivateAdapter(id: string): Promise<void> {
+    await request(`/v1/capabilities/${encodeURIComponent(id)}/active-adapter`, {
+      method: 'DELETE',
+    });
+  },
+  async getSettings(): Promise<SettingsPayload> {
+    return request<SettingsPayload>('/v1/settings');
+  },
+  async updateSettings(args: Partial<RuntimeSettings>): Promise<SettingsPayload> {
+    return request<SettingsPayload>('/v1/settings', {
+      method: 'PUT',
+      body: JSON.stringify(args),
+    });
   },
 };
