@@ -12,6 +12,7 @@ import contextlib
 import json
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -153,7 +154,134 @@ class TraceStore:
         with self._lock:
             return list(self._buffer.eval_scores)
 
+    def list_eval_scores(
+        self,
+        *,
+        project_id: str | None = None,
+        capability_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        rows = self._merge_rows(
+            persisted=self._query_rows(
+                "SELECT trace_id, project_id, capability_id, dimension, score, passed, "
+                "reason, judge_model, ts FROM eval_scores"
+            ),
+            buffered=self.buffered_eval_scores(),
+            key=lambda row: (
+                row["trace_id"],
+                row["capability_id"],
+                row["dimension"],
+                row.get("judge_model", ""),
+            ),
+        )
+        if project_id is not None:
+            rows = [row for row in rows if row["project_id"] == project_id]
+        if capability_id is not None:
+            rows = [row for row in rows if row["capability_id"] == capability_id]
+        if trace_id is not None:
+            rows = [row for row in rows if row["trace_id"] == trace_id]
+        rows.sort(key=lambda row: row.get("ts", ""), reverse=True)
+        return rows
+
+    def list_traces(
+        self,
+        *,
+        project_id: str | None = None,
+        capability_id: str | None = None,
+        status: str | None = None,
+        provider: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        rows = self._merge_rows(
+            persisted=self._normalize_traces(
+                self._query_rows(
+                    "SELECT trace_id, span_id, parent_span_id, project_id, capability_ids, "
+                    "provider, model, method, request, response, prompt_tokens, "
+                    "completion_tokens, total_tokens, cost_usd, latency_ms, status, error, "
+                    "tags, ts FROM traces"
+                )
+            ),
+            buffered=self.buffered_traces(),
+            key=lambda row: (row["trace_id"], row["project_id"], row["method"]),
+        )
+
+        if project_id is not None:
+            rows = [row for row in rows if row["project_id"] == project_id]
+        if status is not None:
+            rows = [row for row in rows if row["status"] == status]
+        if provider is not None:
+            rows = [row for row in rows if row["provider"] == provider]
+        if capability_id is not None:
+            trace_ids = {
+                row["trace_id"]
+                for row in self.list_eval_scores(capability_id=capability_id, project_id=project_id)
+            }
+            rows = [row for row in rows if row["trace_id"] in trace_ids]
+
+        rows.sort(key=lambda row: row.get("ts", ""), reverse=True)
+        total = len(rows)
+        return rows[offset : offset + limit], total
+
+    def list_feedback(self) -> list[dict[str, Any]]:
+        return self._merge_rows(
+            persisted=self._query_rows(
+                "SELECT feedback_id, trace_id, project_id, score, thumb, comment, "
+                "corrected_response, ts FROM feedback"
+            ),
+            buffered=self.buffered_feedback(),
+            key=lambda row: row["feedback_id"],
+        )
+
     # -- internals -------------------------------------------------------
+
+    def _query_rows(self, sql: str) -> list[dict[str, Any]]:
+        self.connect()
+        client = self._client
+        if client is None:
+            return []
+        try:
+            result = client.query(sql)
+        except Exception as exc:  # pragma: no cover - env dependent
+            logger.warning("ClickHouse query failed: %s", exc)
+            return []
+
+        column_names = list(getattr(result, "column_names", []) or [])
+        rows = list(getattr(result, "result_rows", []) or [])
+        return [dict(zip(column_names, row, strict=False)) for row in rows]
+
+    def _merge_rows(
+        self,
+        *,
+        persisted: list[dict[str, Any]],
+        buffered: list[dict[str, Any]],
+        key: Callable[[dict[str, Any]], Any],
+    ) -> list[dict[str, Any]]:
+        merged: dict[Any, dict[str, Any]] = {}
+        for row in persisted + buffered:
+            normalized = _normalize_row(row)
+            merged[key(normalized)] = normalized
+        return list(merged.values())
+
+    def _normalize_traces(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            item = _normalize_row(row)
+            for field_name in ("request", "response"):
+                value = item.get(field_name)
+                if isinstance(value, str):
+                    with contextlib.suppress(json.JSONDecodeError):
+                        item[field_name] = json.loads(value)
+            tags = item.get("tags")
+            if not isinstance(tags, dict):
+                item["tags"] = dict(tags or {})
+            capabilities = item.get("capability_ids")
+            if capabilities is None:
+                item["capability_ids"] = []
+            elif not isinstance(capabilities, list):
+                item["capability_ids"] = list(capabilities)
+            normalized.append(item)
+        return normalized
 
     def _flush_traces(self) -> None:
         self.connect()
@@ -328,3 +456,13 @@ def _trace_to_row(trace: TraceRecord) -> dict[str, Any]:
         "tags": dict(trace.tags),
         "ts": datetime.now(UTC),
     }
+
+
+def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    ts = normalized.get("ts")
+    if isinstance(ts, datetime):
+        normalized["ts"] = ts.astimezone(UTC).isoformat()
+    if "passed" in normalized:
+        normalized["passed"] = bool(normalized["passed"])
+    return normalized
