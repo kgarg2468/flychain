@@ -11,7 +11,7 @@ describe('cli', () => {
   it('registers init and instrument commands', () => {
     const program = buildProgram();
     const names = program.commands.map((c) => c.name()).sort();
-    assert.deepEqual(names, ['init', 'instrument']);
+    assert.deepEqual(names, ['bootstrap', 'init', 'instrument']);
   });
 
   it('instrument has --apply flag', () => {
@@ -30,5 +30,13 @@ describe('cli', () => {
     assert.ok(longs.includes('--project-id'));
     assert.ok(longs.includes('--gateway-url'));
     assert.ok(longs.includes('--force'));
+  });
+
+  it('bootstrap has local-models subcommand', () => {
+    const program = buildProgram();
+    const bootstrap = program.commands.find((c) => c.name() === 'bootstrap');
+    assert.ok(bootstrap, 'bootstrap command should exist');
+    const subcommands = bootstrap.commands.map((c) => c.name());
+    assert.deepEqual(subcommands, ['local-models']);
   });
 });

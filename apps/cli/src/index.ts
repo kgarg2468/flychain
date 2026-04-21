@@ -3,6 +3,7 @@
 import { Command } from 'commander';
 import pc from 'picocolors';
 
+import { runBootstrapLocalModels } from './commands/bootstrap.js';
 import { runInit } from './commands/init.js';
 import { runInstrument } from './commands/instrument.js';
 
@@ -44,6 +45,22 @@ export function buildProgram(): Command {
     .action(async (opts) => {
       try {
         await runInstrument({ apply: Boolean(opts.apply) });
+      } catch (e) {
+        console.error(pc.red('error:'), (e as Error).message);
+        process.exitCode = 1;
+      }
+    });
+
+  const bootstrap = program
+    .command('bootstrap')
+    .description('Bootstrap local FlyChain runtime dependencies');
+
+  bootstrap
+    .command('local-models')
+    .description('Pull the local Ollama judge and embedding models used by FlyChain')
+    .action(async () => {
+      try {
+        await runBootstrapLocalModels();
       } catch (e) {
         console.error(pc.red('error:'), (e as Error).message);
         process.exitCode = 1;
