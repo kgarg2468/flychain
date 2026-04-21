@@ -84,10 +84,16 @@ services:
     environment:
       FLYCHAIN_CLICKHOUSE_URL: http://flychain:flychain@clickhouse:8123/flychain
       FLYCHAIN_POSTGRES_URL: postgresql://flychain:flychain@postgres:5432/flychain
+      FLYCHAIN_REDIS_URL: redis://redis:6379/0
       FLYCHAIN_OLLAMA_URL: http://ollama:11434
+      FLYCHAIN_DATA_DIR: /data
+      FLYCHAIN_JUDGE_MODEL: llama3.2:3b
+      FLYCHAIN_EMBEDDING_MODEL: nomic-embed-text
       FLYCHAIN_ENV: local
     ports:
       - '8080:8080'
+    volumes:
+      - ./.flychain-data:/data
 
   orchestrator:
     build:
@@ -108,7 +114,12 @@ services:
       FLYCHAIN_POSTGRES_URL: postgresql://flychain:flychain@postgres:5432/flychain
       FLYCHAIN_REDIS_URL: redis://redis:6379/0
       FLYCHAIN_OLLAMA_URL: http://ollama:11434
+      FLYCHAIN_DATA_DIR: /data
+      FLYCHAIN_JUDGE_MODEL: llama3.2:3b
+      FLYCHAIN_EMBEDDING_MODEL: nomic-embed-text
       FLYCHAIN_ENV: local
+    volumes:
+      - ./.flychain-data:/data
 
   dashboard:
     build:
