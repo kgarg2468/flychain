@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from flychain_gateway import main as gw_main
+from flychain_gateway.training_store import TrainingRun
 
 
 class FakeLLM:
@@ -25,6 +26,15 @@ class FakeLLM:
         if not self._responses:
             raise AssertionError("FakeLLM: out of responses")
         return self._responses.pop(0)
+
+
+class _FakeQueue:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def enqueue_job(self, function: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append({"function": function, "args": args, "kwargs": kwargs})
+        return {"job_id": f"job-{len(self.calls)}"}
 
 
 @pytest.fixture
@@ -93,42 +103,18 @@ def test_ab_compare_capability_missing_404(client: TestClient) -> None:
 
 def test_activate_run_moves_pointer(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     _mk_groundedness(client)
-
-    # Synthesize a dataset so we can run training.
-    failures = [
-        {
-            "trace_id": "t1",
-            "project_id": "p",
-            "input": "q",
-            "output": "bad",
-            "corrected_response": "good",
-        }
-    ]
-    cluster = {
-        "id": "groundedness-c0",
-        "capability_id": "groundedness",
-        "label": "x",
-        "size": 1,
-        "trace_ids": ["t1"],
-    }
-    dataset = client.post(
-        "/v1/capabilities/groundedness/synthesize-dataset",
-        json={
-            "cluster": cluster,
-            "failures": failures,
-            "method": "sft",
-            "generate_missing": False,
-        },
-    ).json()
-
-    run = client.post(
-        "/v1/training-runs",
-        json={
-            "capability_id": "groundedness",
-            "recipe_id": "sft-mlx-lora",
-            "dataset_id": dataset["id"],
-        },
-    ).json()
+    run = TrainingRun(
+        id="run_trained",
+        capability_id="groundedness",
+        recipe_id="sft-mlx-lora",
+        dataset_id="ds_demo",
+        dataset_path=str(Path(client.app.state.training_run_store.directory) / "demo.jsonl"),
+        status="trained",
+        created_at="2026-04-22T00:00:00+00:00",
+        updated_at="2026-04-22T00:00:00+00:00",
+        artifact={"adapter_dir": str(Path(client.app.state.training_run_store.directory) / "adapter")},
+    )
+    client.app.state.training_run_store.save(run)
 
     # No active adapter yet.
     assert client.get("/v1/capabilities/groundedness/active-adapter").json()["active"] is None
@@ -136,13 +122,13 @@ def test_activate_run_moves_pointer(client: TestClient, monkeypatch: pytest.Monk
     # Activate the trained run explicitly.
     resp = client.post(
         "/v1/capabilities/groundedness/active-adapter",
-        json={"run_id": run["id"]},
+        json={"run_id": run.id},
     )
     assert resp.status_code == 200
-    assert resp.json()["active_run_id"] == run["id"]
+    assert resp.json()["active_run_id"] == run.id
 
     active = client.get("/v1/capabilities/groundedness/active-adapter").json()
-    assert active["active"]["active_run_id"] == run["id"]
+    assert active["active"]["active_run_id"] == run.id
 
     # Deactivate.
     resp = client.delete("/v1/capabilities/groundedness/active-adapter")
@@ -157,6 +143,130 @@ def test_activate_unknown_run_404(client: TestClient) -> None:
         json={"run_id": "run_missing"},
     )
     assert resp.status_code == 404
+
+
+def test_replay_set_crud_and_ab_compare_persists_latest_comparison(client: TestClient) -> None:
+    _mk_groundedness(client)
+    run = TrainingRun(
+        id="run_trained",
+        capability_id="groundedness",
+        recipe_id="sft-mlx-lora",
+        dataset_id="ds_demo",
+        dataset_path="/tmp/demo.jsonl",
+        status="trained",
+        created_at="2026-04-22T00:00:00+00:00",
+        updated_at="2026-04-22T00:00:00+00:00",
+        artifact={"adapter_dir": "/tmp/adapter"},
+        baseline={"groundedness": 0.4},
+    )
+    client.app.state.training_run_store.save(run)
+
+    created = client.post(
+        "/v1/capabilities/groundedness/replay-sets",
+        json={
+            "name": "held-out",
+            "rows": [
+                {
+                    "trace_id": "t1",
+                    "project_id": "p",
+                    "input": "q1",
+                    "context": "source",
+                    "baseline_output": "wrong",
+                    "candidate_output": "right",
+                    "tags": {"task": "rag"},
+                }
+            ],
+        },
+    )
+    assert created.status_code == 201, created.text
+    replay_set = created.json()
+    assert replay_set["name"] == "held-out"
+
+    updated = client.put(
+        f"/v1/capabilities/groundedness/replay-sets/{replay_set['id']}",
+        json={
+            "name": "held-out-v2",
+            "rows": [
+                {
+                    "trace_id": "t1",
+                    "project_id": "p",
+                    "input": "q1",
+                    "context": "source",
+                    "baseline_output": "wrong",
+                    "candidate_output": "better",
+                    "tags": {"task": "rag"},
+                },
+                {
+                    "trace_id": "t2",
+                    "project_id": "p",
+                    "input": "q2",
+                    "context": "source",
+                    "baseline_output": "wrong",
+                    "candidate_output": "better",
+                    "tags": {"task": "rag"},
+                },
+            ],
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["name"] == "held-out-v2"
+
+    listed = client.get("/v1/capabilities/groundedness/replay-sets")
+    assert listed.status_code == 200
+    assert len(listed.json()["replay_sets"]) == 1
+
+    compared = client.post(
+        "/v1/capabilities/groundedness/ab-compare",
+        json={"run_id": run.id, "replay_set_id": replay_set["id"]},
+    )
+    assert compared.status_code == 200, compared.text
+    body = compared.json()
+    assert body["sample_count"] == 2
+
+    saved_run = client.get(f"/v1/training-runs/{run.id}").json()
+    assert saved_run["latest_comparison"]["replay_set_id"] == replay_set["id"]
+    assert saved_run["latest_comparison"]["delta"] == pytest_approx(body["delta"])
+
+
+def test_apply_gate_uses_latest_comparison_when_candidate_omitted(client: TestClient) -> None:
+    _mk_groundedness(client)
+    queue = _FakeQueue()
+    client.app.state.job_queue = queue
+    run = TrainingRun(
+        id="run_trained",
+        capability_id="groundedness",
+        recipe_id="sft-mlx-lora",
+        dataset_id="ds_demo",
+        dataset_path="/tmp/demo.jsonl",
+        status="trained",
+        created_at="2026-04-22T00:00:00+00:00",
+        updated_at="2026-04-22T00:00:00+00:00",
+        artifact={"adapter_dir": "/tmp/adapter"},
+        baseline={"groundedness": 0.4},
+        latest_comparison={
+            "replay_set_id": "replay_1",
+            "baseline": {"aggregate_score": 0.4},
+            "candidate": {"aggregate_score": 0.82},
+            "delta": 0.42,
+            "ts": "2026-04-22T00:00:00+00:00",
+        },
+    )
+    client.app.state.training_run_store.save(run)
+
+    gate = client.post(f"/v1/training-runs/{run.id}/apply-gate", json={})
+    assert gate.status_code == 202, gate.text
+    assert gate.json()["status"] == "gate-queued"
+    assert queue.calls == [
+        {
+            "function": "apply_promotion_gate",
+            "args": (),
+            "kwargs": {
+                "run_id": run.id,
+                "candidate": {"groundedness": 0.82},
+                "baseline": {"groundedness": 0.4},
+            },
+        }
+    ]
 
 
 def pytest_approx(expected: float, tol: float = 1e-6):
