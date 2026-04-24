@@ -1,5 +1,18 @@
-# flychain-sdk (Python)
+# flychain-sdk
 
-Thin client SDK for the FlyChain gateway.
+Thin Python SDK package. The current public surface is a version constant and a
+gateway URL helper.
 
-Phase 0 exposes configuration helpers. Phase 1 adds the actual client with chat completions, feedback submission, and trace retrieval.
+Deep dive:
+[../../docs/architecture/dashboard-cli-sdks.md](../../docs/architecture/dashboard-cli-sdks.md)
+
+## API
+
+```python
+from flychain import gateway_base_url
+
+url = gateway_base_url()
+```
+
+`gateway_base_url` reads `FLYCHAIN_GATEWAY_URL` and otherwise returns
+`http://localhost:8080` or the caller-supplied default.
