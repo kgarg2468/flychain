@@ -207,7 +207,9 @@ def test_failures_endpoint_derives_trace_eval_and_feedback_state(client: TestCli
                 model="gpt-4o-mini",
                 method="chat.completions",
                 request={"messages": [{"role": "user", "content": "What is the refund window?"}]},
-                response={"choices": [{"message": {"content": "Refunds are available for 90 days."}}]},
+                response={
+                    "choices": [{"message": {"content": "Refunds are available for 90 days."}}]
+                },
                 status="ok",
                 tags={"task": "rag"},
             )

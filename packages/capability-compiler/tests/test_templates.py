@@ -41,9 +41,7 @@ def test_template_by_id_lookup() -> None:
     assert any(d.id == "all_claims_supported" for d in g.eval_dimensions)
 
 
-def test_default_templates_dir_respects_env_override(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_default_templates_dir_respects_env_override(monkeypatch, tmp_path: Path) -> None:
     custom = tmp_path / "templates"
     custom.mkdir()
     monkeypatch.setenv("FLYCHAIN_TEMPLATES_DIR", str(custom))

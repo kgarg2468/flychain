@@ -148,9 +148,7 @@ def _chat_input_text(messages: list[Any]) -> str:
         return getattr(message, "content", None)
 
     parts = [
-        _flatten_content(_content(message))
-        for message in messages
-        if _role(message) == "user"
+        _flatten_content(_content(message)) for message in messages if _role(message) == "user"
     ]
     joined = "\n".join(part for part in parts if part)
     if joined:
@@ -281,7 +279,9 @@ def create_app() -> FastAPI:
             return
         queue: ArqRedis | None = getattr(app.state, "job_queue", None)
         if queue is None:
-            logger.warning("auto-eval skipped for %s because background queue is unavailable", trace_id)
+            logger.warning(
+                "auto-eval skipped for %s because background queue is unavailable", trace_id
+            )
             return
         if not output_text.strip():
             return
@@ -330,10 +330,7 @@ def create_app() -> FastAPI:
             grouped.setdefault(row["trace_id"], {})
             grouped[row["trace_id"]].setdefault(row["dimension"], row)
 
-        traces = {
-            row["trace_id"]: row
-            for row in list_all_traces(capability_id=capability_id)
-        }
+        traces = {row["trace_id"]: row for row in list_all_traces(capability_id=capability_id)}
         feedback_rows = sorted(
             trace_store.list_feedback(),
             key=lambda row: row.get("ts", ""),
@@ -366,9 +363,8 @@ def create_app() -> FastAPI:
             failures.append(
                 {
                     "trace_id": trace_id,
-                    "project_id": trace.get("project_id") or next(
-                        iter(dim_rows.values())
-                    )["project_id"],
+                    "project_id": trace.get("project_id")
+                    or next(iter(dim_rows.values()))["project_id"],
                     "input": _chat_input_text(request_payload.get("messages", [])),
                     "output": (
                         _messages_output_text(response_payload)
@@ -933,9 +929,7 @@ def create_app() -> FastAPI:
     def settings_put(body: UpdateSettingsRequest) -> dict[str, Any]:
         store: SettingsStore = app.state.local_settings_store
         current = store.load()
-        settings = store.save(
-            current.model_copy(update=body.model_dump(exclude_none=True))
-        )
+        settings = store.save(current.model_copy(update=body.model_dump(exclude_none=True)))
         return {
             "settings": settings.model_dump(mode="json"),
             "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
@@ -1029,7 +1023,9 @@ def create_app() -> FastAPI:
                 trace_ids=body.cluster.trace_ids,
             )
             if body.failures is None:
-                raise HTTPException(status_code=400, detail="provide failures when cluster is inline")
+                raise HTTPException(
+                    status_code=400, detail="provide failures when cluster is inline"
+                )
             failures = [
                 FailedTrace(
                     trace_id=ft.trace_id,
@@ -1055,7 +1051,9 @@ def create_app() -> FastAPI:
                 capability=spec,
                 cluster=cluster,
                 failures=failures,
-                llm=auto_client(ollama_model=runtime.judge_model) if body.generate_missing else None,
+                llm=auto_client(ollama_model=runtime.judge_model)
+                if body.generate_missing
+                else None,
                 generate_missing=body.generate_missing,
             )
         elif method == "dpo":
@@ -1064,7 +1062,9 @@ def create_app() -> FastAPI:
                 capability=spec,
                 cluster=cluster,
                 failures=failures,
-                llm=auto_client(ollama_model=runtime.judge_model) if body.generate_missing else None,
+                llm=auto_client(ollama_model=runtime.judge_model)
+                if body.generate_missing
+                else None,
                 generate_missing=body.generate_missing,
             )
         else:
@@ -1236,7 +1236,9 @@ def create_app() -> FastAPI:
     def capability_replay_sets(capability_id: str) -> dict[str, Any]:
         replay_store: ReplaySetStore = app.state.replay_set_store
         return {
-            "replay_sets": [asdict(item) for item in replay_store.list_for_capability(capability_id)]
+            "replay_sets": [
+                asdict(item) for item in replay_store.list_for_capability(capability_id)
+            ]
         }
 
     @app.post("/v1/capabilities/{capability_id}/replay-sets", status_code=201)

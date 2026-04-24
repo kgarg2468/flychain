@@ -112,7 +112,9 @@ def test_activate_run_moves_pointer(client: TestClient, monkeypatch: pytest.Monk
         status="trained",
         created_at="2026-04-22T00:00:00+00:00",
         updated_at="2026-04-22T00:00:00+00:00",
-        artifact={"adapter_dir": str(Path(client.app.state.training_run_store.directory) / "adapter")},
+        artifact={
+            "adapter_dir": str(Path(client.app.state.training_run_store.directory) / "adapter")
+        },
     )
     client.app.state.training_run_store.save(run)
 
