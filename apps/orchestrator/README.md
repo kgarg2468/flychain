@@ -1,23 +1,30 @@
-# FlyChain orchestrator
+# FlyChain Orchestrator
 
-`arq`-based worker process that drives the capability flywheel:
+arq-based worker process for FlyChain background jobs. It consumes Redis jobs
+created by the gateway and updates shared state under `$FLYCHAIN_DATA_DIR`.
 
-1. Consume new traces and evaluate them per capability (Phase 4).
-2. Embed failures and cluster them with HDBSCAN (Phase 5).
-3. Synthesize training datasets from clusters (Phase 5).
-4. Execute training recipes against the appropriate backend (Phase 6).
-5. Apply the auto-promote gate (Phase 6).
+Deep dives:
 
-Phase 0 ships a scaffold with a single `noop` task.
+- [System overview](../../docs/architecture/system-overview.md)
+- [Capability flywheel](../../docs/architecture/capability-flywheel.md)
 
-## Local dev
+## Jobs
+
+- `noop`: health/check task.
+- `evaluate_trace`: calls gateway `POST /v1/eval`.
+- `run_training_recipe`: loads a training run, selects a backend, writes
+  artifacts, and marks the run trained or failed.
+- `apply_promotion_gate`: applies the recipe gate and writes the active adapter
+  pointer when promoted.
+
+## Local Dev
 
 ```bash
 uv sync
 uv run arq flychain_orchestrator.worker.WorkerSettings
 ```
 
-Or via Docker:
+Or via Docker Compose:
 
 ```bash
 docker compose up orchestrator
