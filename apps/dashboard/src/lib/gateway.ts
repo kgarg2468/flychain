@@ -102,6 +102,38 @@ export interface DatasetEntry {
   row_count: number;
 }
 
+export interface FailureRow {
+  trace_id: string;
+  project_id: string;
+  input: string;
+  output: string;
+  context: string;
+  tags: Record<string, string>;
+  ts: string;
+  aggregate_score: number | null;
+  failing_dimensions: string[];
+  corrected_response: string | null;
+}
+
+export interface ReplaySetRow {
+  trace_id: string;
+  project_id?: string;
+  input: string;
+  context?: string;
+  baseline_output: string;
+  candidate_output: string;
+  tags?: Record<string, string>;
+}
+
+export interface ReplaySetRecord {
+  id: string;
+  capability_id: string;
+  name: string;
+  rows: ReplaySetRow[];
+  created_at: string;
+  updated_at: string;
+}
+
 export interface TrainingRunRow {
   id: string;
   capability_id: string;
@@ -114,6 +146,14 @@ export interface TrainingRunRow {
   baseline: Record<string, number>;
   candidate: Record<string, number>;
   gate_verdict: Record<string, unknown> | null;
+  latest_comparison: {
+    replay_set_id: string | null;
+    baseline: { aggregate_score: number };
+    candidate: { aggregate_score: number };
+    delta: number;
+    ts: string;
+  } | null;
+  allow_backend_fallback: boolean;
   error: string | null;
 }
 
@@ -253,10 +293,15 @@ export const gateway = {
   async clusters(id: string): Promise<ClustersResponse> {
     return request<ClustersResponse>(`/v1/capabilities/${encodeURIComponent(id)}/clusters`);
   },
+  async failures(id: string): Promise<{ capability_id: string; failures: FailureRow[] }> {
+    return request<{ capability_id: string; failures: FailureRow[] }>(
+      `/v1/capabilities/${encodeURIComponent(id)}/failures`,
+    );
+  },
   async clusterRun(
     id: string,
     args: {
-      failures: Array<{
+      failures?: Array<{
         trace_id: string;
         project_id?: string;
         input: string;
@@ -265,6 +310,7 @@ export const gateway = {
         corrected_response?: string;
         tags?: Record<string, string>;
       }>;
+      failure_ids?: string[];
       min_cluster_size?: number;
       summarize?: boolean;
     },
@@ -282,14 +328,15 @@ export const gateway = {
   async synthesizeDataset(
     id: string,
     args: {
-      cluster: {
+      cluster?: {
         id: string;
         capability_id: string;
         label: string;
         size: number;
         trace_ids: string[];
       };
-      failures: Array<{
+      cluster_id?: string;
+      failures?: Array<{
         trace_id: string;
         project_id?: string;
         input: string;
@@ -302,10 +349,34 @@ export const gateway = {
       generate_missing?: boolean;
     },
   ): Promise<DatasetEntry> {
-    return request<DatasetEntry>(
-      `/v1/capabilities/${encodeURIComponent(id)}/synthesize-dataset`,
+    return request<DatasetEntry>(`/v1/capabilities/${encodeURIComponent(id)}/synthesize-dataset`, {
+      method: 'POST',
+      body: JSON.stringify(args),
+    });
+  },
+  async replaySets(id: string): Promise<{ replay_sets: ReplaySetRecord[] }> {
+    return request<{ replay_sets: ReplaySetRecord[] }>(
+      `/v1/capabilities/${encodeURIComponent(id)}/replay-sets`,
+    );
+  },
+  async createReplaySet(
+    id: string,
+    args: { name: string; rows: ReplaySetRow[] },
+  ): Promise<ReplaySetRecord> {
+    return request<ReplaySetRecord>(`/v1/capabilities/${encodeURIComponent(id)}/replay-sets`, {
+      method: 'POST',
+      body: JSON.stringify(args),
+    });
+  },
+  async updateReplaySet(
+    id: string,
+    replaySetId: string,
+    args: { name: string; rows: ReplaySetRow[] },
+  ): Promise<ReplaySetRecord> {
+    return request<ReplaySetRecord>(
+      `/v1/capabilities/${encodeURIComponent(id)}/replay-sets/${encodeURIComponent(replaySetId)}`,
       {
-        method: 'POST',
+        method: 'PUT',
         body: JSON.stringify(args),
       },
     );
@@ -332,7 +403,7 @@ export const gateway = {
   async abCompare(
     id: string,
     args: {
-      replay: Array<{
+      replay?: Array<{
         trace_id: string;
         project_id?: string;
         input: string;
@@ -341,6 +412,8 @@ export const gateway = {
         candidate_output: string;
         tags?: Record<string, string>;
       }>;
+      replay_set_id?: string;
+      run_id?: string;
     },
   ): Promise<{
     capability_id: string;
@@ -356,11 +429,8 @@ export const gateway = {
   },
   async applyGate(
     runId: string,
-    args: { candidate: Record<string, number>; baseline?: Record<string, number> },
-  ): Promise<{
-    run: TrainingRunRow;
-    verdict: Record<string, unknown>;
-  }> {
+    args: { candidate?: Record<string, number>; baseline?: Record<string, number> },
+  ): Promise<TrainingRunRow> {
     return request(`/v1/training-runs/${encodeURIComponent(runId)}/apply-gate`, {
       method: 'POST',
       body: JSON.stringify(args),
