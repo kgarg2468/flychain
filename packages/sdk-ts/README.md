@@ -1,5 +1,18 @@
-# @flychain/sdk (TypeScript)
+# @flychain/sdk
 
-Thin TypeScript client SDK for the FlyChain gateway.
+Thin TypeScript SDK package. The current public surface is configuration
+helpers, not a full gateway client.
 
-Phase 0 exposes config helpers. Phase 1 adds the real client (chat completions, feedback, trace retrieval).
+Deep dive:
+[../../docs/architecture/dashboard-cli-sdks.md](../../docs/architecture/dashboard-cli-sdks.md)
+
+## API
+
+```ts
+import { resolveConfig } from '@flychain/sdk';
+
+const config = resolveConfig();
+```
+
+`resolveConfig` combines caller overrides with `FLYCHAIN_GATEWAY_URL`,
+`FLYCHAIN_API_KEY`, and `FLYCHAIN_PROJECT_ID` environment variables.
