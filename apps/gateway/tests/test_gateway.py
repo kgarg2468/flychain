@@ -15,11 +15,21 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from flychain_gateway.main import create_app
+from flychain_gateway.settings_store import LocalSettings
 
 
 class _MockTransport(httpx.MockTransport):
     def __init__(self, responder):
         super().__init__(responder)
+
+
+class _FakeQueue:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def enqueue_job(self, function: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append({"function": function, "args": args, "kwargs": kwargs})
+        return {"job_id": f"job-{len(self.calls)}"}
 
 
 def _openai_responder(request: httpx.Request) -> httpx.Response:
@@ -180,6 +190,81 @@ def test_messages_anthropic_path(client: TestClient) -> None:
     assert row["prompt_tokens"] == 8
     assert row["completion_tokens"] == 4
     assert row["total_tokens"] == 12
+
+
+def test_chat_completions_enqueues_auto_eval_when_enabled(client: TestClient) -> None:
+    queue = _FakeQueue()
+    client.app.state.job_queue = queue
+    client.app.state.local_settings_store.save(LocalSettings(auto_eval_new_traces=True))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "What does the policy say?"}],
+        },
+        headers={
+            "x-flychain-project": "unit-test",
+            "x-flychain-capabilities": "groundedness",
+            "x-flychain-tags": "task=rag",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    trace_id = resp.headers["x-flychain-trace-id"]
+
+    assert queue.calls == [
+        {
+            "function": "evaluate_trace",
+            "args": (),
+            "kwargs": {
+                "trace_id": trace_id,
+                "project_id": "unit-test",
+                "input_text": "What does the policy say?",
+                "output_text": "hello from mock",
+                "context": "",
+                "tags": {"task": "rag"},
+                "capability_ids": ["groundedness"],
+            },
+        }
+    ]
+
+
+def test_messages_enqueues_auto_eval_when_enabled(client: TestClient) -> None:
+    queue = _FakeQueue()
+    client.app.state.job_queue = queue
+    client.app.state.local_settings_store.save(LocalSettings(auto_eval_new_traces=True))
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "claude-3-5-haiku-latest",
+            "messages": [{"role": "user", "content": "Summarize the doc"}],
+            "max_tokens": 128,
+        },
+        headers={
+            "x-flychain-project": "anthropic-test",
+            "x-flychain-capabilities": "groundedness",
+            "x-flychain-tags": "task=rag",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    trace_id = resp.headers["x-flychain-trace-id"]
+
+    assert queue.calls == [
+        {
+            "function": "evaluate_trace",
+            "args": (),
+            "kwargs": {
+                "trace_id": trace_id,
+                "project_id": "anthropic-test",
+                "input_text": "Summarize the doc",
+                "output_text": "hi",
+                "context": "",
+                "tags": {"task": "rag"},
+                "capability_ids": ["groundedness"],
+            },
+        }
+    ]
 
 
 def test_feedback_endpoint(client: TestClient) -> None:
