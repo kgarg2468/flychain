@@ -7,7 +7,9 @@ import {
   type ActiveAdapter,
   type ClustersResponse,
   type DatasetEntry,
+  type FailureRow,
   type RecipeRow,
+  type ReplaySetRecord,
   type Scorecard,
   type TrainingRunRow,
 } from '@/lib/gateway';
@@ -51,6 +53,20 @@ export default async function CapabilityPage({ params }: Params) {
     runs = (await gateway.trainingRuns(id)).runs;
   } catch {
     runs = [];
+  }
+
+  let failures: FailureRow[] = [];
+  try {
+    failures = (await gateway.failures(id)).failures;
+  } catch {
+    failures = [];
+  }
+
+  let replaySets: ReplaySetRecord[] = [];
+  try {
+    replaySets = (await gateway.replaySets(id)).replay_sets;
+  } catch {
+    replaySets = [];
   }
 
   let activeAdapter: ActiveAdapter | null = null;
@@ -334,6 +350,21 @@ export default async function CapabilityPage({ params }: Params) {
                 <div className="mt-1 text-xs text-neutral-500">
                   recipe: {r.recipe_id} / dataset: {r.dataset_id}
                 </div>
+                {r.latest_comparison ? (
+                  <div className="mt-1 text-xs text-neutral-500">
+                    latest compare: {r.latest_comparison.delta >= 0 ? '+' : ''}
+                    {r.latest_comparison.delta.toFixed(3)}
+                    {r.latest_comparison.replay_set_id
+                      ? ` via ${r.latest_comparison.replay_set_id}`
+                      : ''}
+                  </div>
+                ) : null}
+                {r.artifact ? (
+                  <div className="mt-1 text-xs text-neutral-500">
+                    backend: {String((r.artifact as { backend?: string }).backend ?? 'unknown')}
+                    {Boolean((r.artifact as { dry_run?: boolean }).dry_run) ? ' (dry-run)' : ''}
+                  </div>
+                ) : null}
                 {r.gate_verdict ? (
                   <div className="mt-1 text-xs text-neutral-500">
                     gate: {String((r.gate_verdict as { reason?: string }).reason ?? '')}
@@ -351,6 +382,8 @@ export default async function CapabilityPage({ params }: Params) {
         datasets={datasets}
         runs={runs}
         recipes={recipes}
+        failures={failures}
+        replaySets={replaySets}
       />
     </main>
   );
