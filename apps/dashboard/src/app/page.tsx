@@ -134,11 +134,17 @@ export default async function HomePage() {
                     />
                     <Stat
                       label="Adapter Delta"
-                      value={delta === null ? 'No adapter' : `${delta >= 0 ? '+' : ''}${delta.toFixed(3)}`}
+                      value={
+                        delta === null
+                          ? 'No adapter'
+                          : `${delta >= 0 ? '+' : ''}${delta.toFixed(3)}`
+                      }
                     />
                     <Stat
                       label="Trend"
-                      value={delta === null ? 'steady' : delta > 0 ? 'up' : delta < 0 ? 'down' : 'steady'}
+                      value={
+                        delta === null ? 'steady' : delta > 0 ? 'up' : delta < 0 ? 'down' : 'steady'
+                      }
                     />
                   </div>
 
