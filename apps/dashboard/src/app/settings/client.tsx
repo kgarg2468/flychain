@@ -114,11 +114,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-function Toggle(props: {
-  label: string;
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-}) {
+function Toggle(props: { label: string; checked: boolean; onChange: (checked: boolean) => void }) {
   return (
     <label className="flex items-center justify-between rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm">
       <span>{props.label}</span>
