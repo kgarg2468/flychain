@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from flychain_capability_compiler import (
@@ -17,14 +20,12 @@ from flychain_capability_compiler import (
     SynthesizedDataset,
     TraceData,
     aggregate_score,
-    apply_gate,
     auto_client,
     auto_embedder,
     cluster_failures,
     list_recipes,
     list_templates,
     recipe_by_id,
-    select_backend,
     synthesize_dpo_dataset,
     synthesize_sft_dataset,
     template_by_id,
@@ -47,6 +48,7 @@ from flychain_gateway.config import Settings, get_settings
 from flychain_gateway.models_registry import ModelNotFoundError, ModelRegistry, get_registry
 from flychain_gateway.otel import get_tracer, make_llm_attributes, setup_tracing
 from flychain_gateway.providers.registry import ProviderRouter
+from flychain_gateway.replay_store import ReplaySet, ReplaySetStore
 from flychain_gateway.schemas import (
     AnthropicMessagesRequest,
     ChatCompletionRequest,
@@ -61,6 +63,16 @@ from flychain_gateway.training_store import (
     TrainingRun,
     TrainingRunStore,
 )
+
+try:
+    from arq.connections import ArqRedis, RedisSettings, create_pool
+except Exception:  # pragma: no cover - optional import in some envs
+    ArqRedis = Any  # type: ignore[assignment,misc]
+    RedisSettings = Any  # type: ignore[assignment,misc]
+    create_pool = None  # type: ignore[assignment]
+
+
+logger = logging.getLogger(__name__)
 
 
 def _new_id(prefix: str) -> str:
@@ -89,6 +101,91 @@ def _extract_headers(
     return project_id, capabilities, tags
 
 
+def _redis_settings_from_url(url: str) -> RedisSettings:
+    parsed = urlparse(url)
+    return RedisSettings(
+        host=parsed.hostname or "localhost",
+        port=parsed.port or 6379,
+        database=int((parsed.path or "/0").lstrip("/") or 0),
+    )
+
+
+def _flatten_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    parts.append(text)
+                continue
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+                continue
+            content_value = item.get("content")
+            if isinstance(content_value, str) and content_value.strip():
+                parts.append(content_value.strip())
+        return "\n".join(parts)
+    return str(content).strip()
+
+
+def _chat_input_text(messages: list[Any]) -> str:
+    def _role(message: Any) -> str:
+        if isinstance(message, dict):
+            return str(message.get("role", ""))
+        return str(getattr(message, "role", ""))
+
+    def _content(message: Any) -> Any:
+        if isinstance(message, dict):
+            return message.get("content")
+        return getattr(message, "content", None)
+
+    parts = [
+        _flatten_content(_content(message))
+        for message in messages
+        if _role(message) == "user"
+    ]
+    joined = "\n".join(part for part in parts if part)
+    if joined:
+        return joined
+    fallback = [_flatten_content(_content(message)) for message in messages]
+    return "\n".join(part for part in fallback if part)
+
+
+def _chat_output_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if isinstance(message, dict):
+            return _flatten_content(message.get("content"))
+    return ""
+
+
+def _messages_output_text(payload: dict[str, Any]) -> str:
+    return _flatten_content(payload.get("content"))
+
+
+def _payload_dict(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, str):
+        import json as _json
+
+        try:
+            parsed = _json.loads(payload)
+        except _json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     get_settings.cache_clear()
@@ -115,7 +212,14 @@ async def lifespan(app: FastAPI):
     dataset_store = DatasetStore(data_root / "datasets")
     training_run_store = TrainingRunStore(data_root / "runs")
     adapter_pointer_store = AdapterPointerStore(data_root / "pointers")
+    replay_set_store = ReplaySetStore(data_root / "replay-sets")
     local_settings_store = SettingsStore(data_root / "settings.json")
+    job_queue: ArqRedis | None = None
+    if create_pool is not None:
+        try:
+            job_queue = await create_pool(_redis_settings_from_url(settings.redis_url), retry=0)
+        except Exception as exc:  # pragma: no cover - depends on env
+            logger.warning("Redis queue unavailable (%s); background jobs disabled", exc)
 
     app.state.settings = settings
     app.state.registry = registry
@@ -126,11 +230,16 @@ async def lifespan(app: FastAPI):
     app.state.dataset_store = dataset_store
     app.state.training_run_store = training_run_store
     app.state.adapter_pointer_store = adapter_pointer_store
+    app.state.replay_set_store = replay_set_store
     app.state.local_settings_store = local_settings_store
+    app.state.job_queue = job_queue
 
     try:
         yield
     finally:
+        if job_queue is not None:
+            with suppress(Exception):
+                await job_queue.aclose()
         store.close()
 
 
@@ -148,6 +257,169 @@ def create_app() -> FastAPI:
     def local_settings() -> LocalSettings:
         store: SettingsStore = app.state.local_settings_store
         return store.load()
+
+    def require_job_queue() -> ArqRedis:
+        queue: ArqRedis | None = getattr(app.state, "job_queue", None)
+        if queue is None:
+            raise HTTPException(
+                status_code=503,
+                detail="background job queue is unavailable; check Redis/orchestrator",
+            )
+        return queue
+
+    async def maybe_enqueue_auto_eval(
+        *,
+        trace_id: str,
+        project_id: str,
+        input_text: str,
+        output_text: str,
+        tags: dict[str, str],
+        capability_ids: list[str],
+    ) -> None:
+        runtime = local_settings()
+        if not runtime.auto_eval_new_traces:
+            return
+        queue: ArqRedis | None = getattr(app.state, "job_queue", None)
+        if queue is None:
+            logger.warning("auto-eval skipped for %s because background queue is unavailable", trace_id)
+            return
+        if not output_text.strip():
+            return
+        await queue.enqueue_job(
+            "evaluate_trace",
+            trace_id=trace_id,
+            project_id=project_id,
+            input_text=input_text,
+            output_text=output_text,
+            context="",
+            tags=tags,
+            capability_ids=capability_ids or None,
+        )
+
+    def list_all_traces(*, capability_id: str | None = None) -> list[dict[str, Any]]:
+        store: TraceStore = app.state.trace_store
+        offset = 0
+        limit = 200
+        collected: list[dict[str, Any]] = []
+        while True:
+            batch, total = store.list_traces(
+                capability_id=capability_id,
+                limit=limit,
+                offset=offset,
+            )
+            collected.extend(batch)
+            offset += len(batch)
+            if not batch or offset >= total:
+                break
+        return collected
+
+    def derive_failures(capability_id: str) -> list[dict[str, Any]]:
+        capability_store: CapabilityStore = app.state.capability_store
+        trace_store: TraceStore = app.state.trace_store
+        try:
+            spec = capability_store.get(capability_id)
+        except CapabilityNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"no such capability: {exc}") from exc
+
+        eval_rows = trace_store.list_eval_scores(capability_id=capability_id)
+        if not eval_rows:
+            return []
+
+        grouped: dict[str, dict[str, dict[str, Any]]] = {}
+        for row in eval_rows:
+            grouped.setdefault(row["trace_id"], {})
+            grouped[row["trace_id"]].setdefault(row["dimension"], row)
+
+        traces = {
+            row["trace_id"]: row
+            for row in list_all_traces(capability_id=capability_id)
+        }
+        feedback_rows = sorted(
+            trace_store.list_feedback(),
+            key=lambda row: row.get("ts", ""),
+            reverse=True,
+        )
+        feedback_by_trace: dict[str, dict[str, Any]] = {}
+        for row in feedback_rows:
+            feedback_by_trace.setdefault(row["trace_id"], row)
+
+        weights = {dimension.id: float(dimension.weight) for dimension in spec.eval_dimensions}
+        failures: list[dict[str, Any]] = []
+        for trace_id, dim_rows in grouped.items():
+            failing_dimensions = sorted(
+                dimension for dimension, row in dim_rows.items() if not bool(row["passed"])
+            )
+            if not failing_dimensions:
+                continue
+
+            trace = traces.get(trace_id, {})
+            request_payload = _payload_dict(trace.get("request"))
+            response_payload = _payload_dict(trace.get("response"))
+            total_weight = 0.0
+            weighted_score = 0.0
+            for dimension, row in dim_rows.items():
+                weight = float(weights.get(dimension, 1.0))
+                total_weight += weight
+                weighted_score += float(row["score"]) * weight
+
+            feedback = feedback_by_trace.get(trace_id, {})
+            failures.append(
+                {
+                    "trace_id": trace_id,
+                    "project_id": trace.get("project_id") or next(
+                        iter(dim_rows.values())
+                    )["project_id"],
+                    "input": _chat_input_text(request_payload.get("messages", [])),
+                    "output": (
+                        _messages_output_text(response_payload)
+                        if trace.get("method") == "messages"
+                        else _chat_output_text(response_payload)
+                    ),
+                    "context": _flatten_content(request_payload.get("context")),
+                    "tags": dict(trace.get("tags") or {}),
+                    "ts": trace.get("ts") or max(row.get("ts", "") for row in dim_rows.values()),
+                    "aggregate_score": (weighted_score / total_weight) if total_weight else None,
+                    "failing_dimensions": failing_dimensions,
+                    "corrected_response": feedback.get("corrected_response") or None,
+                }
+            )
+
+        failures.sort(key=lambda row: row.get("ts", ""), reverse=True)
+        return failures
+
+    def resolve_failed_traces(capability_id: str, trace_ids: list[str]) -> list[FailedTrace]:
+        failure_map = {row["trace_id"]: row for row in derive_failures(capability_id)}
+        missing = [trace_id for trace_id in trace_ids if trace_id not in failure_map]
+        if missing:
+            raise HTTPException(status_code=404, detail=f"no such failures: {', '.join(missing)}")
+        return [
+            FailedTrace(
+                trace_id=row["trace_id"],
+                project_id=row["project_id"],
+                input=row["input"],
+                output=row["output"],
+                context=row.get("context") or "",
+                corrected_response=row.get("corrected_response"),
+                tags=dict(row.get("tags") or {}),
+            )
+            for row in (failure_map[trace_id] for trace_id in trace_ids)
+        ]
+
+    def resolve_cluster(capability_id: str, cluster_id: str) -> Cluster:
+        cluster_store: ClusterStore = app.state.cluster_store
+        stored = cluster_store.load(capability_id)
+        if stored is None:
+            raise HTTPException(status_code=404, detail=f"no stored clusters for {capability_id}")
+        for cluster in stored.get("clusters", []):
+            if cluster.get("id") == cluster_id:
+                return Cluster(
+                    id=cluster["id"],
+                    capability_id=cluster["capability_id"],
+                    label=cluster["label"],
+                    size=cluster["size"],
+                    trace_ids=list(cluster["trace_ids"]),
+                )
+        raise HTTPException(status_code=404, detail=f"no such cluster: {cluster_id}")
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -187,7 +459,7 @@ def create_app() -> FastAPI:
         store: TraceStore = app.state.trace_store
         registry: ModelRegistry = app.state.registry
 
-        project_id, _capability_ids, tags = _extract_headers(
+        project_id, capability_ids, tags = _extract_headers(
             x_flychain_project=x_flychain_project,
             x_flychain_capabilities=x_flychain_capabilities,
             x_flychain_tags=x_flychain_tags,
@@ -281,6 +553,14 @@ def create_app() -> FastAPI:
                     tags=tags,
                 )
             )
+            await maybe_enqueue_auto_eval(
+                trace_id=trace_id,
+                project_id=project_id,
+                input_text=_chat_input_text(body.messages),
+                output_text=_chat_output_text(result.payload),
+                tags=tags,
+                capability_ids=capability_ids,
+            )
 
         response_body = dict(result.payload)
         response_body.setdefault("id", trace_id)
@@ -309,7 +589,7 @@ def create_app() -> FastAPI:
         store: TraceStore = app.state.trace_store
         registry: ModelRegistry = app.state.registry
 
-        project_id, _capability_ids, tags = _extract_headers(
+        project_id, capability_ids, tags = _extract_headers(
             x_flychain_project=x_flychain_project,
             x_flychain_capabilities=x_flychain_capabilities,
             x_flychain_tags=x_flychain_tags,
@@ -401,6 +681,14 @@ def create_app() -> FastAPI:
                     error=error,
                     tags=tags,
                 )
+            )
+            await maybe_enqueue_auto_eval(
+                trace_id=trace_id,
+                project_id=project_id,
+                input_text=_chat_input_text(body.messages),
+                output_text=_messages_output_text(result.payload),
+                tags=tags,
+                capability_ids=capability_ids,
             )
 
         response_body = dict(result.payload)
@@ -654,6 +942,13 @@ def create_app() -> FastAPI:
             "anthropic_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
         }
 
+    @app.get("/v1/capabilities/{capability_id}/failures")
+    def capabilities_failures(capability_id: str) -> dict[str, Any]:
+        return {
+            "capability_id": capability_id,
+            "failures": derive_failures(capability_id),
+        }
+
     @app.post("/v1/capabilities/{capability_id}/cluster-run")
     async def capabilities_cluster_run(
         capability_id: str, body: ClusterRunRequest
@@ -671,18 +966,23 @@ def create_app() -> FastAPI:
         except CapabilityNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"no such capability: {exc}") from exc
 
-        failures = [
-            FailedTrace(
-                trace_id=ft.trace_id,
-                project_id=ft.project_id or "default",
-                input=ft.input,
-                output=ft.output,
-                context=ft.context or "",
-                corrected_response=ft.corrected_response,
-                tags=dict(ft.tags or {}),
-            )
-            for ft in body.failures
-        ]
+        if body.failures is not None:
+            failures = [
+                FailedTrace(
+                    trace_id=ft.trace_id,
+                    project_id=ft.project_id or "default",
+                    input=ft.input,
+                    output=ft.output,
+                    context=ft.context or "",
+                    corrected_response=ft.corrected_response,
+                    tags=dict(ft.tags or {}),
+                )
+                for ft in body.failures
+            ]
+        elif body.failure_ids:
+            failures = resolve_failed_traces(capability_id, body.failure_ids)
+        else:
+            raise HTTPException(status_code=400, detail="provide failures or failure_ids")
 
         runtime = local_settings()
         result = await cluster_failures(
@@ -720,25 +1020,33 @@ def create_app() -> FastAPI:
         except CapabilityNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"no such capability: {exc}") from exc
 
-        failures = [
-            FailedTrace(
-                trace_id=ft.trace_id,
-                project_id=ft.project_id or "default",
-                input=ft.input,
-                output=ft.output,
-                context=ft.context or "",
-                corrected_response=ft.corrected_response,
-                tags=dict(ft.tags or {}),
+        if body.cluster is not None:
+            cluster = Cluster(
+                id=body.cluster.id,
+                capability_id=body.cluster.capability_id,
+                label=body.cluster.label,
+                size=body.cluster.size,
+                trace_ids=body.cluster.trace_ids,
             )
-            for ft in body.failures
-        ]
-        cluster = Cluster(
-            id=body.cluster.id,
-            capability_id=body.cluster.capability_id,
-            label=body.cluster.label,
-            size=body.cluster.size,
-            trace_ids=body.cluster.trace_ids,
-        )
+            if body.failures is None:
+                raise HTTPException(status_code=400, detail="provide failures when cluster is inline")
+            failures = [
+                FailedTrace(
+                    trace_id=ft.trace_id,
+                    project_id=ft.project_id or "default",
+                    input=ft.input,
+                    output=ft.output,
+                    context=ft.context or "",
+                    corrected_response=ft.corrected_response,
+                    tags=dict(ft.tags or {}),
+                )
+                for ft in body.failures
+            ]
+        elif body.cluster_id:
+            cluster = resolve_cluster(capability_id, body.cluster_id)
+            failures = resolve_failed_traces(capability_id, cluster.trace_ids)
+        else:
+            raise HTTPException(status_code=400, detail="provide cluster or cluster_id")
 
         method = body.method.lower()
         if method == "sft":
@@ -801,14 +1109,9 @@ def create_app() -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"no such recipe: {exc}") from exc
 
-    @app.post("/v1/training-runs")
-    def training_runs_create(body: CreateTrainingRun) -> dict[str, Any]:
-        """Create and immediately execute a training run.
-
-        V1 runs synchronously - the dry-run backend is fast and the MLX /
-        unsloth backends run out-of-band when configured. Async orchestration
-        via arq is available; see ``apps/orchestrator``.
-        """
+    @app.post("/v1/training-runs", status_code=202)
+    async def training_runs_create(body: CreateTrainingRun) -> dict[str, Any]:
+        """Create a queued training run and hand execution to the orchestrator."""
         capability_store: CapabilityStore = app.state.capability_store
         dataset_store: DatasetStore = app.state.dataset_store
         run_store: TrainingRunStore = app.state.training_run_store
@@ -826,6 +1129,7 @@ def create_app() -> FastAPI:
         dataset_path = dataset_store.resolve_path(body.dataset_id)
         if dataset_path is None:
             raise HTTPException(status_code=404, detail=f"no such dataset: {body.dataset_id}")
+        queue = require_job_queue()
 
         run_id = f"run_{ULID()}"
         now = _now_iso()
@@ -835,35 +1139,25 @@ def create_app() -> FastAPI:
             recipe_id=recipe.id,
             dataset_id=body.dataset_id,
             dataset_path=str(dataset_path),
-            status="running",
+            status="queued",
             created_at=now,
             updated_at=now,
             artifact=None,
             baseline=dict(body.baseline or {}),
             candidate={},
+            allow_backend_fallback=body.allow_backend_fallback,
         )
         run_store.save(run)
 
         try:
-            backend = select_backend(
-                recipe.backend.value, allow_fallback=body.allow_backend_fallback
-            )
-            artifact = backend.run(
-                recipe=recipe,
-                dataset_path=dataset_path,
-                output_dir=default_data_dir() / "runs" / run_id / "artifacts",
-            )
-            run.artifact = artifact.as_dict()
-            run.status = "trained"
-            run.updated_at = _now_iso()
+            await queue.enqueue_job("run_training_recipe", run_id=run.id)
         except Exception as exc:
             run.status = "failed"
-            run.error = str(exc)
+            run.error = f"queue enqueue failed: {exc}"
             run.updated_at = _now_iso()
             run_store.save(run)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-        run_store.save(run)
         return _run_to_dict(run)
 
     @app.get("/v1/training-runs")
@@ -880,16 +1174,10 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=f"no such training run: {run_id}")
         return _run_to_dict(run)
 
-    @app.post("/v1/training-runs/{run_id}/apply-gate")
-    def training_runs_apply_gate(run_id: str, body: ApplyGateRequest) -> dict[str, Any]:
-        """Apply the auto-promote gate to a trained run.
-
-        The caller supplies the candidate's per-capability aggregate scores
-        (produced by running the eval suite against the new adapter); the
-        baseline comes from the stored run (falling back to the body).
-        """
+    @app.post("/v1/training-runs/{run_id}/apply-gate", status_code=202)
+    async def training_runs_apply_gate(run_id: str, body: ApplyGateRequest) -> dict[str, Any]:
+        """Queue gate application for a trained run."""
         run_store: TrainingRunStore = app.state.training_run_store
-        adapter_store: AdapterPointerStore = app.state.adapter_pointer_store
 
         run = run_store.load(run_id)
         if run is None:
@@ -898,41 +1186,91 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=409, detail=f"run not in a gate-eligible state: {run.status}"
             )
+        queue = require_job_queue()
+        if body.candidate is not None:
+            candidate = dict(body.candidate)
+            baseline = dict(body.baseline) if body.baseline is not None else None
+        elif run.latest_comparison is not None:
+            baseline_score = float(run.latest_comparison["baseline"]["aggregate_score"])
+            candidate_score = float(run.latest_comparison["candidate"]["aggregate_score"])
+            baseline = dict(run.baseline)
+            baseline[run.capability_id] = baseline_score
+            candidate = {run.capability_id: candidate_score}
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="candidate scores required unless latest comparison is available",
+            )
 
-        try:
-            recipe = recipe_by_id(run.recipe_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"recipe missing: {exc}") from exc
+        previous_status = run.status
+        previous_baseline = dict(run.baseline)
+        previous_candidate = dict(run.candidate)
 
-        baseline = body.baseline if body.baseline is not None else run.baseline
-        verdict = apply_gate(
-            target_capability_id=run.capability_id,
-            baseline=baseline,
-            candidate=body.candidate,
-            threshold=recipe.promotion_threshold,
-            max_other_regression=recipe.max_other_regression,
-        )
-
-        run.baseline = dict(baseline)
-        run.candidate = dict(body.candidate)
-        run.gate_verdict = verdict.as_dict()
-        run.status = "promoted" if verdict.promoted() else "archived"
+        run.baseline = dict(baseline if baseline is not None else run.baseline)
+        run.candidate = dict(candidate)
+        run.status = "gate-queued"
         run.updated_at = _now_iso()
         run_store.save(run)
 
-        if verdict.promoted() and run.artifact is not None:
-            adapter_store.set_active(
-                run.capability_id,
+        try:
+            await queue.enqueue_job(
+                "apply_promotion_gate",
                 run_id=run.id,
-                adapter_dir=run.artifact.get("adapter_dir", ""),
-                baseline=run.baseline,
-                candidate=run.candidate,
+                candidate=candidate,
+                baseline=baseline,
             )
+        except Exception as exc:
+            run.status = previous_status
+            run.baseline = previous_baseline
+            run.candidate = previous_candidate
+            run.error = f"queue enqueue failed: {exc}"
+            run.updated_at = _now_iso()
+            run_store.save(run)
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+        run.error = None
+        run_store.save(run)
+        return _run_to_dict(run)
+
+    @app.get("/v1/capabilities/{capability_id}/replay-sets")
+    def capability_replay_sets(capability_id: str) -> dict[str, Any]:
+        replay_store: ReplaySetStore = app.state.replay_set_store
         return {
-            "run": _run_to_dict(run),
-            "verdict": verdict.as_dict(),
+            "replay_sets": [asdict(item) for item in replay_store.list_for_capability(capability_id)]
         }
+
+    @app.post("/v1/capabilities/{capability_id}/replay-sets", status_code=201)
+    def capability_replay_sets_create(
+        capability_id: str, body: ReplaySetWriteRequest
+    ) -> dict[str, Any]:
+        capability_store: CapabilityStore = app.state.capability_store
+        replay_store: ReplaySetStore = app.state.replay_set_store
+        if not capability_store.exists(capability_id):
+            raise HTTPException(status_code=404, detail="no such capability")
+        record = ReplaySet(
+            id=f"replay_{ULID()}",
+            capability_id=capability_id,
+            name=body.name,
+            rows=[row.model_dump(mode="json") for row in body.rows],
+            created_at=_now_iso(),
+            updated_at=_now_iso(),
+        )
+        replay_store.save(record)
+        return asdict(record)
+
+    @app.put("/v1/capabilities/{capability_id}/replay-sets/{replay_set_id}")
+    def capability_replay_sets_update(
+        capability_id: str, replay_set_id: str, body: ReplaySetWriteRequest
+    ) -> dict[str, Any]:
+        replay_store: ReplaySetStore = app.state.replay_set_store
+        record = replay_store.load(replay_set_id)
+        if record is None or record.capability_id != capability_id:
+            raise HTTPException(status_code=404, detail=f"no such replay set: {replay_set_id}")
+        record.name = body.name
+        record.rows = [row.model_dump(mode="json") for row in body.rows]
+        record.updated_at = _now_iso()
+        replay_store.save(record)
+        return asdict(record)
 
     @app.get("/v1/capabilities/{capability_id}/active-adapter")
     def capability_active_adapter(capability_id: str) -> dict[str, Any]:
@@ -1007,12 +1345,26 @@ def create_app() -> FastAPI:
             spec = capability_store.get(capability_id)
         except CapabilityNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"no such capability: {exc}") from exc
+        replay_store: ReplaySetStore = app.state.replay_set_store
+        run_store: TrainingRunStore = app.state.training_run_store
+
+        if body.replay is not None:
+            replay_rows = body.replay
+        elif body.replay_set_id is not None:
+            replay_set = replay_store.load(body.replay_set_id)
+            if replay_set is None or replay_set.capability_id != capability_id:
+                raise HTTPException(
+                    status_code=404, detail=f"no such replay set: {body.replay_set_id}"
+                )
+            replay_rows = [ReplayRow.model_validate(row) for row in replay_set.rows]
+        else:
+            raise HTTPException(status_code=400, detail="provide replay or replay_set_id")
 
         runtime = local_settings()
         engine = EvalEngine(llm=auto_client(ollama_model=runtime.judge_model))
         baseline_scores = []
         candidate_scores = []
-        for row in body.replay:
+        for row in replay_rows:
             base_trace = TraceData(
                 trace_id=f"{row.trace_id}:baseline",
                 project_id=row.project_id or "default",
@@ -1034,9 +1386,9 @@ def create_app() -> FastAPI:
 
         baseline_agg = aggregate_score(baseline_scores, spec)
         candidate_agg = aggregate_score(candidate_scores, spec)
-        return {
+        response = {
             "capability_id": capability_id,
-            "sample_count": len(body.replay),
+            "sample_count": len(replay_rows),
             "baseline": {
                 "aggregate_score": baseline_agg,
                 "scores": [s.as_dict() for s in baseline_scores],
@@ -1047,6 +1399,20 @@ def create_app() -> FastAPI:
             },
             "delta": candidate_agg - baseline_agg,
         }
+        if body.run_id is not None:
+            run = run_store.load(body.run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail=f"no such training run: {body.run_id}")
+            run.latest_comparison = {
+                "replay_set_id": body.replay_set_id,
+                "baseline": {"aggregate_score": baseline_agg},
+                "candidate": {"aggregate_score": candidate_agg},
+                "delta": candidate_agg - baseline_agg,
+                "ts": _now_iso(),
+            }
+            run.updated_at = _now_iso()
+            run_store.save(run)
+        return response
 
     @app.get("/v1/capabilities/{capability_id}/scorecard")
     def capability_scorecard(capability_id: str) -> dict[str, Any]:
@@ -1148,7 +1514,8 @@ class FailingTraceInput(BaseModel):
 
 class ClusterRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    failures: list[FailingTraceInput]
+    failures: list[FailingTraceInput] | None = None
+    failure_ids: list[str] | None = None
     min_cluster_size: int = 3
     summarize: bool = True
 
@@ -1164,8 +1531,9 @@ class ClusterInput(BaseModel):
 
 class SynthesizeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    cluster: ClusterInput
-    failures: list[FailingTraceInput]
+    cluster: ClusterInput | None = None
+    cluster_id: str | None = None
+    failures: list[FailingTraceInput] | None = None
     method: str = "sft"
     generate_missing: bool = True
 
@@ -1181,7 +1549,7 @@ class CreateTrainingRun(BaseModel):
 
 class ApplyGateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    candidate: dict[str, float]
+    candidate: dict[str, float] | None = None
     baseline: dict[str, float] | None = None
 
 
@@ -1210,9 +1578,17 @@ class ReplayRow(BaseModel):
     tags: dict[str, str] | None = None
 
 
+class ReplaySetWriteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    rows: list[ReplayRow]
+
+
 class ABCompareRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    replay: list[ReplayRow]
+    replay: list[ReplayRow] | None = None
+    replay_set_id: str | None = None
+    run_id: str | None = None
 
 
 def _now_iso() -> str:
@@ -1235,6 +1611,8 @@ def _run_to_dict(run: TrainingRun) -> dict[str, Any]:
         "baseline": run.baseline,
         "candidate": run.candidate,
         "gate_verdict": run.gate_verdict,
+        "latest_comparison": run.latest_comparison,
+        "allow_backend_fallback": run.allow_backend_fallback,
         "error": run.error,
     }
 
