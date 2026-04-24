@@ -1,17 +1,25 @@
 # @flychain/cli
 
-The FlyChain CLI. Ships as a single `flychain` command.
+Node CLI for project setup, source instrumentation, and local model bootstrap.
 
-Ships three commands today:
+Deep dive:
+[../../docs/architecture/dashboard-cli-sdks.md](../../docs/architecture/dashboard-cli-sdks.md)
 
-- `init` writes `flychain.config.json`
-- `instrument` patches supported Python/TypeScript OpenAI clients
-- `bootstrap local-models` pulls the local Ollama models FlyChain expects for judge + embeddings
+## Commands
 
-## Usage (Phase 0)
+- `flychain init`: writes `flychain.config.json`.
+- `flychain instrument`: previews or applies OpenAI/Anthropic constructor
+  rewrites so application traffic points at the FlyChain gateway.
+- `flychain bootstrap local-models`: starts the Compose Ollama service and
+  pulls the local judge and embedding models.
+
+## Usage
 
 ```bash
 pnpm -F @flychain/cli build
 node ./apps/cli/dist/index.js --help
+node ./apps/cli/dist/index.js init
+node ./apps/cli/dist/index.js instrument
+node ./apps/cli/dist/index.js instrument --apply
 node ./apps/cli/dist/index.js bootstrap local-models
 ```
