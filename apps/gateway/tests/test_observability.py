@@ -56,7 +56,12 @@ class FakeClickHouseClient:
             self.tables[table].append(dict(zip(column_names, row, strict=False)))
 
     def query(self, sql: str) -> FakeQueryResult:
-        table = "traces" if "FROM traces" in sql else "eval_scores"
+        if "FROM traces" in sql:
+            table = "traces"
+        elif "FROM feedback" in sql:
+            table = "feedback"
+        else:
+            table = "eval_scores"
         return FakeQueryResult(self.tables.get(table, []))
 
 
@@ -186,3 +191,73 @@ def test_settings_endpoint_is_env_first_and_persists_local_knobs(client: TestCli
 
     reread = client.get("/v1/settings").json()
     assert reread["settings"]["judge_model"] == "llama3.2:1b-instruct"
+
+
+def test_failures_endpoint_derives_trace_eval_and_feedback_state(client: TestClient) -> None:
+    resp = client.post("/v1/capabilities/from-template", json={"template_id": "groundedness"})
+    assert resp.status_code == 201
+
+    store = client.app.state.trace_store
+    asyncio.run(
+        store.insert_trace(
+            TraceRecord(
+                trace_id="trace-failure",
+                project_id="proj-a",
+                provider="openai",
+                model="gpt-4o-mini",
+                method="chat.completions",
+                request={"messages": [{"role": "user", "content": "What is the refund window?"}]},
+                response={"choices": [{"message": {"content": "Refunds are available for 90 days."}}]},
+                status="ok",
+                tags={"task": "rag"},
+            )
+        )
+    )
+    asyncio.run(
+        store.insert_eval_scores(
+            [
+                {
+                    "trace_id": "trace-failure",
+                    "project_id": "proj-a",
+                    "capability_id": "groundedness",
+                    "dimension": "all_claims_supported",
+                    "score": 0.2,
+                    "passed": False,
+                    "reason": "unsupported",
+                    "judge_model": "fake",
+                },
+                {
+                    "trace_id": "trace-failure",
+                    "project_id": "proj-a",
+                    "capability_id": "groundedness",
+                    "dimension": "no_material_omissions",
+                    "score": 0.8,
+                    "passed": True,
+                    "reason": "fine",
+                    "judge_model": "fake",
+                },
+            ]
+        )
+    )
+    asyncio.run(
+        store.insert_feedback(
+            feedback_id="fb-1",
+            trace_id="trace-failure",
+            project_id="proj-a",
+            thumb="down",
+            score=-2,
+            comment="wrong",
+            corrected_response="Refunds are available for 30 days.",
+        )
+    )
+
+    failures = client.get("/v1/capabilities/groundedness/failures")
+    assert failures.status_code == 200, failures.text
+    body = failures.json()
+    assert body["capability_id"] == "groundedness"
+    assert len(body["failures"]) == 1
+    failure = body["failures"][0]
+    assert failure["trace_id"] == "trace-failure"
+    assert failure["corrected_response"] == "Refunds are available for 30 days."
+    assert failure["failing_dimensions"] == ["all_claims_supported"]
+    assert failure["aggregate_score"] < 1.0
