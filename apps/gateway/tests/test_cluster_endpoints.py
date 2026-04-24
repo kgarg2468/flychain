@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterator
 from pathlib import Path
@@ -11,6 +12,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from flychain_gateway import main as gw_main
+from flychain_gateway.schemas import TraceRecord
 
 
 class FakeLLM:
@@ -87,6 +89,54 @@ def _failing_payload(i: int, corrected: str | None = None) -> dict[str, Any]:
     if corrected is not None:
         out["corrected_response"] = corrected
     return out
+
+
+def _seed_failure_records(client: TestClient, count: int = 8) -> None:
+    store = client.app.state.trace_store
+    for i in range(count):
+        trace_id = f"t{i}"
+        asyncio.run(
+            store.insert_trace(
+                TraceRecord(
+                    trace_id=trace_id,
+                    project_id="p1",
+                    provider="openai",
+                    model="gpt-4o-mini",
+                    method="chat.completions",
+                    request={"messages": [{"role": "user", "content": f"question {i}"}]},
+                    response={"choices": [{"message": {"content": f"wrong answer {i}"}}]},
+                    status="ok",
+                    tags={"task": "rag"},
+                )
+            )
+        )
+        asyncio.run(
+            store.insert_eval_scores(
+                [
+                    {
+                        "trace_id": trace_id,
+                        "project_id": "p1",
+                        "capability_id": "groundedness",
+                        "dimension": "all_claims_supported",
+                        "score": 0.2,
+                        "passed": False,
+                        "reason": "unsupported",
+                        "judge_model": "fake",
+                    }
+                ]
+            )
+        )
+        asyncio.run(
+            store.insert_feedback(
+                feedback_id=f"fb-{i}",
+                trace_id=trace_id,
+                project_id="p1",
+                thumb="down",
+                score=-1,
+                comment="bad",
+                corrected_response=f"ideal answer {i}",
+            )
+        )
 
 
 def test_cluster_run_persists_and_lists(client: TestClient) -> None:
@@ -202,3 +252,47 @@ def test_synthesize_unknown_method_400(client: TestClient) -> None:
         },
     )
     assert resp.status_code == 400
+
+
+def test_cluster_run_accepts_failure_ids(client: TestClient) -> None:
+    _mk_groundedness(client)
+    _seed_failure_records(client)
+
+    resp = client.post(
+        "/v1/capabilities/groundedness/cluster-run",
+        json={
+            "failure_ids": [f"t{i}" for i in range(8)],
+            "min_cluster_size": 3,
+            "summarize": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["clusters"]) == 2
+
+
+def test_synthesize_dataset_accepts_cluster_id_only(client: TestClient) -> None:
+    _mk_groundedness(client)
+    _seed_failure_records(client)
+    clustered = client.post(
+        "/v1/capabilities/groundedness/cluster-run",
+        json={
+            "failure_ids": [f"t{i}" for i in range(8)],
+            "min_cluster_size": 3,
+            "summarize": True,
+        },
+    ).json()
+    assert clustered["clusters"]
+
+    resp = client.post(
+        "/v1/capabilities/groundedness/synthesize-dataset",
+        json={
+            "cluster_id": clustered["clusters"][0]["id"],
+            "method": "sft",
+            "generate_missing": False,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["cluster_id"] == clustered["clusters"][0]["id"]
+    assert body["row_count"] >= 1
