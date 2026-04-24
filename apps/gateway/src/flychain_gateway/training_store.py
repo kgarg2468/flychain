@@ -22,13 +22,15 @@ class TrainingRun:
     recipe_id: str
     dataset_id: str
     dataset_path: str
-    status: str  # queued | running | trained | promoted | archived | failed
+    status: str  # queued | running | trained | gate-queued | gate-running | promoted | archived | failed
     created_at: str
     updated_at: str
     artifact: dict[str, Any] | None = None
     baseline: dict[str, float] = field(default_factory=dict)
     candidate: dict[str, float] = field(default_factory=dict)
     gate_verdict: dict[str, Any] | None = None
+    latest_comparison: dict[str, Any] | None = None
+    allow_backend_fallback: bool = True
     error: str | None = None
 
 
