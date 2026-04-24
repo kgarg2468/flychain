@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -10,6 +9,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from flychain_gateway.main import create_app
+from flychain_gateway.training_store import TrainingRun
 
 
 @pytest.fixture
@@ -65,6 +65,44 @@ def _setup_dataset(client: TestClient, tmp_path_factory: Any | None = None) -> d
     return resp.json()
 
 
+class _FakeQueue:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def enqueue_job(self, function: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append({"function": function, "args": args, "kwargs": kwargs})
+        return {"job_id": f"job-{len(self.calls)}"}
+
+
+def _save_trained_run(
+    client: TestClient,
+    *,
+    capability_id: str,
+    recipe_id: str,
+    dataset_id: str,
+    dataset_path: str,
+    baseline: dict[str, float] | None = None,
+) -> TrainingRun:
+    run = TrainingRun(
+        id="run_existing",
+        capability_id=capability_id,
+        recipe_id=recipe_id,
+        dataset_id=dataset_id,
+        dataset_path=dataset_path,
+        status="trained",
+        created_at="2026-04-22T00:00:00+00:00",
+        updated_at="2026-04-22T00:00:00+00:00",
+        artifact={
+            "adapter_dir": str(Path(dataset_path).parent / "adapter"),
+            "dry_run": True,
+        },
+        baseline=dict(baseline or {}),
+        candidate={},
+    )
+    client.app.state.training_run_store.save(run)
+    return run
+
+
 def test_recipes_endpoint_lists_v1_recipes(client: TestClient) -> None:
     resp = client.get("/v1/recipes")
     assert resp.status_code == 200
@@ -78,8 +116,10 @@ def test_recipes_get_by_id(client: TestClient) -> None:
     assert resp.json()["backend"] == "mlx-lm"
 
 
-def test_training_run_uses_dry_run_when_backend_unavailable(client: TestClient) -> None:
+def test_training_run_is_queued_and_enqueued(client: TestClient) -> None:
     dataset = _setup_dataset(client)
+    queue = _FakeQueue()
+    client.app.state.job_queue = queue
     resp = client.post(
         "/v1/training-runs",
         json={
@@ -89,14 +129,20 @@ def test_training_run_uses_dry_run_when_backend_unavailable(client: TestClient) 
             "allow_backend_fallback": True,
         },
     )
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     body = resp.json()
-    assert body["status"] == "trained"
-    assert body["artifact"]["dry_run"] is True
-    adapter_json = Path(body["artifact"]["adapter_dir"]) / "adapter.json"
-    assert adapter_json.exists()
-    data = json.loads(adapter_json.read_text())
-    assert data["recipe_id"] == "sft-unsloth-lora"
+    assert body["status"] == "queued"
+    assert body["artifact"] is None
+    assert queue.calls == [
+        {
+            "function": "run_training_recipe",
+            "args": (),
+            "kwargs": {"run_id": body["id"]},
+        }
+    ]
+    saved = client.get(f"/v1/training-runs/{body['id']}")
+    assert saved.status_code == 200
+    assert saved.json()["status"] == "queued"
 
 
 def test_training_run_unknown_recipe_404(client: TestClient) -> None:
@@ -125,129 +171,58 @@ def test_training_run_unknown_dataset_404(client: TestClient) -> None:
     assert resp.status_code == 404
 
 
-def test_apply_gate_promotes_and_sets_active_adapter(client: TestClient) -> None:
+def test_apply_gate_is_queued(client: TestClient) -> None:
     dataset = _setup_dataset(client)
-    run = client.post(
-        "/v1/training-runs",
-        json={
-            "capability_id": "groundedness",
-            "recipe_id": "sft-mlx-lora",
-            "dataset_id": dataset["id"],
-            "baseline": {"groundedness": 0.60},
-        },
-    ).json()
+    queue = _FakeQueue()
+    client.app.state.job_queue = queue
+    run = _save_trained_run(
+        client,
+        capability_id="groundedness",
+        recipe_id="sft-mlx-lora",
+        dataset_id=dataset["id"],
+        dataset_path=dataset["path"],
+        baseline={"groundedness": 0.60},
+    )
 
     gate_resp = client.post(
-        f"/v1/training-runs/{run['id']}/apply-gate",
+        f"/v1/training-runs/{run.id}/apply-gate",
         json={"candidate": {"groundedness": 0.72}},
     )
-    assert gate_resp.status_code == 200, gate_resp.text
+    assert gate_resp.status_code == 202, gate_resp.text
     body = gate_resp.json()
-    assert body["verdict"]["decision"] == "promote"
-    assert body["run"]["status"] == "promoted"
-
-    active = client.get("/v1/capabilities/groundedness/active-adapter").json()
-    assert active["active"] is not None
-    assert active["active"]["active_run_id"] == run["id"]
-
-
-def test_apply_gate_archives_on_small_delta(client: TestClient) -> None:
-    dataset = _setup_dataset(client)
-    run = client.post(
-        "/v1/training-runs",
-        json={
-            "capability_id": "groundedness",
-            "recipe_id": "sft-mlx-lora",
-            "dataset_id": dataset["id"],
-            "baseline": {"groundedness": 0.60},
-        },
-    ).json()
-
-    gate_resp = client.post(
-        f"/v1/training-runs/{run['id']}/apply-gate",
-        json={"candidate": {"groundedness": 0.61}},  # +0.01 below 0.05 threshold
-    )
-    assert gate_resp.status_code == 200
-    body = gate_resp.json()
-    assert body["verdict"]["decision"] == "archive"
-    assert body["run"]["status"] == "archived"
+    assert body["status"] == "gate-queued"
+    assert body["candidate"] == {"groundedness": 0.72}
+    assert queue.calls == [
+        {
+            "function": "apply_promotion_gate",
+            "args": (),
+            "kwargs": {
+                "baseline": None,
+                "candidate": {"groundedness": 0.72},
+                "run_id": run.id,
+            },
+        }
+    ]
     active = client.get("/v1/capabilities/groundedness/active-adapter").json()
     assert active["active"] is None
 
 
-def test_dpo_recipe_end_to_end(client: TestClient) -> None:
-    """A DPO recipe runs through the dry-run backend when mlx-lm isn't available."""
-    # Create a groundedness capability and synthesize a DPO dataset.
-    client.post("/v1/capabilities/from-template", json={"template_id": "groundedness"})
-    failures = [
-        {
-            "trace_id": "t1",
-            "project_id": "p",
-            "input": "q1",
-            "output": "bad1",
-            "corrected_response": "good1",
-        }
-    ]
-    cluster = {
-        "id": "groundedness-c0",
-        "capability_id": "groundedness",
-        "label": "x",
-        "size": 1,
-        "trace_ids": ["t1"],
-    }
-    dataset = client.post(
-        "/v1/capabilities/groundedness/synthesize-dataset",
-        json={
-            "cluster": cluster,
-            "failures": failures,
-            "method": "dpo",
-            "generate_missing": False,
-        },
-    ).json()
-
-    run = client.post(
-        "/v1/training-runs",
-        json={
-            "capability_id": "groundedness",
-            "recipe_id": "dpo-mlx-lora",
-            "dataset_id": dataset["id"],
-            "baseline": {"groundedness": 0.55},
-        },
-    ).json()
-    assert run["status"] == "trained"
-    assert run["recipe_id"] == "dpo-mlx-lora"
-    import json as _json
-    from pathlib import Path as _P
-
-    adapter_json = _P(run["artifact"]["adapter_dir"]) / "adapter.json"
-    payload = _json.loads(adapter_json.read_text())
-    assert payload["recipe_id"] == "dpo-mlx-lora"
-
-
-def test_apply_gate_archives_on_regression(client: TestClient) -> None:
-    """A regression on another tracked capability beyond tolerance archives."""
+def test_apply_gate_rejects_ineligible_status(client: TestClient) -> None:
     dataset = _setup_dataset(client)
-    run = client.post(
-        "/v1/training-runs",
-        json={
-            "capability_id": "groundedness",
-            "recipe_id": "sft-mlx-lora",
-            "dataset_id": dataset["id"],
-            "baseline": {"groundedness": 0.60, "instruction-following": 0.80},
-        },
-    ).json()
+    run = TrainingRun(
+        id="run_queued",
+        capability_id="groundedness",
+        recipe_id="sft-mlx-lora",
+        dataset_id=dataset["id"],
+        dataset_path=dataset["path"],
+        status="queued",
+        created_at="2026-04-22T00:00:00+00:00",
+        updated_at="2026-04-22T00:00:00+00:00",
+    )
+    client.app.state.training_run_store.save(run)
 
     gate_resp = client.post(
-        f"/v1/training-runs/{run['id']}/apply-gate",
-        json={
-            "candidate": {
-                "groundedness": 0.75,
-                "instruction-following": 0.70,  # -0.10 > 0.02 tolerance
-            }
-        },
+        f"/v1/training-runs/{run.id}/apply-gate",
+        json={"candidate": {"groundedness": 0.75}},
     )
-    body = gate_resp.json()
-    assert body["verdict"]["decision"] == "archive"
-    assert any(
-        r["capability_id"] == "instruction-following" for r in body["verdict"]["regressions"]
-    )
+    assert gate_resp.status_code == 409
