@@ -17,10 +17,12 @@ dependencies = [
     "pyyaml>=6.0.2",
     "numpy>=2.1.1",
     "flychain-capability-compiler",
+    "flychain-gateway",
 ]
 
 [tool.uv.sources]
 flychain-capability-compiler = { workspace = true }
+flychain-gateway = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]
