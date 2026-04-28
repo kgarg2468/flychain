@@ -199,6 +199,50 @@ export interface SettingsPayload {
   };
 }
 
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant' | string;
+  content: string | Array<Record<string, unknown>> | null;
+}
+
+export interface ChatCompletionUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+}
+
+export interface ChatCompletionChoice {
+  index?: number;
+  finish_reason?: string | null;
+  message: ChatMessage & Record<string, unknown>;
+}
+
+export interface ChatCompletionResponse {
+  id?: string;
+  object?: string;
+  created?: number;
+  model?: string;
+  choices: ChatCompletionChoice[];
+  usage?: ChatCompletionUsage;
+  latency_ms?: number;
+  [key: string]: unknown;
+}
+
+export interface ChatCompletionArgs {
+  model: string;
+  messages: ChatMessage[];
+  projectId: string;
+  capabilityIds?: string[];
+  tags?: string;
+  temperature?: number;
+  max_tokens?: number;
+  top_p?: number;
+}
+
+export interface ChatCompletionResult {
+  response: ChatCompletionResponse;
+  traceId: string | null;
+}
+
 function gatewayBaseUrl(): string {
   const fromServer = process.env.FLYCHAIN_GATEWAY_URL;
   if (fromServer) return fromServer;
@@ -224,6 +268,32 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const gateway = {
+  async chatCompletion(args: ChatCompletionArgs): Promise<ChatCompletionResult> {
+    const { projectId, capabilityIds = [], tags, ...body } = args;
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'x-flychain-project': projectId,
+    };
+    if (capabilityIds.length > 0) {
+      headers['x-flychain-capabilities'] = capabilityIds.join(',');
+    }
+    if (tags?.trim()) {
+      headers['x-flychain-tags'] = tags.trim();
+    }
+
+    const res = await fetch('/api/chat/completions', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ...body, stream: false }),
+    });
+    if (!res.ok) {
+      throw new Error(`gateway ${res.status}: ${await res.text()}`);
+    }
+    return {
+      response: (await res.json()) as ChatCompletionResponse,
+      traceId: res.headers.get('x-flychain-trace-id'),
+    };
+  },
   async listCapabilities(): Promise<CapabilitySpec[]> {
     const body = await request<{ capabilities: CapabilitySpec[] }>('/v1/capabilities');
     return body.capabilities;

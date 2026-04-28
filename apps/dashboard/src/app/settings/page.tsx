@@ -28,9 +28,14 @@ export default async function SettingsPage() {
               Env-first runtime controls for the local FlyChain stack.
             </h1>
           </div>
-          <Link href="/" className="text-sm text-neutral-500 hover:text-neutral-900">
-            Back to workspace
-          </Link>
+          <nav className="flex flex-wrap gap-3 text-sm text-neutral-500">
+            <Link href="/chat" className="hover:text-neutral-900">
+              Chat
+            </Link>
+            <Link href="/" className="hover:text-neutral-900">
+              Back to workspace
+            </Link>
+          </nav>
         </header>
 
         <SettingsClient initial={settings} />

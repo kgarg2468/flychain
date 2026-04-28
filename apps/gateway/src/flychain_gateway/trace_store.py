@@ -440,7 +440,7 @@ def _trace_to_row(trace: TraceRecord) -> dict[str, Any]:
         "span_id": "",
         "parent_span_id": "",
         "project_id": trace.project_id,
-        "capability_ids": [],
+        "capability_ids": list(trace.capability_ids),
         "provider": trace.provider,
         "model": trace.model,
         "method": trace.method,

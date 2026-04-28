@@ -119,7 +119,10 @@ def test_chat_completions_openai_path(client: TestClient) -> None:
             "model": "gpt-4o-mini",
             "messages": [{"role": "user", "content": "hi"}],
         },
-        headers={"x-flychain-project": "unit-test"},
+        headers={
+            "x-flychain-project": "unit-test",
+            "x-flychain-capabilities": "instruction-following,groundedness",
+        },
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -130,6 +133,7 @@ def test_chat_completions_openai_path(client: TestClient) -> None:
     assert traces, "trace should have been written to buffer"
     row = traces[-1]
     assert row["project_id"] == "unit-test"
+    assert row["capability_ids"] == ["instruction-following", "groundedness"]
     assert row["provider"] == "openai"
     assert row["prompt_tokens"] == 10
     assert row["completion_tokens"] == 5

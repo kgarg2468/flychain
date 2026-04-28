@@ -72,7 +72,13 @@ export default async function HomePage() {
             >
               New capability
             </Link>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid gap-3 sm:grid-cols-3">
+              <Link
+                href="/chat"
+                className="rounded-2xl border border-neutral-800 px-4 py-3 text-sm text-neutral-300 transition hover:border-neutral-600 hover:text-white"
+              >
+                Chat
+              </Link>
               <Link
                 href="/traces"
                 className="rounded-2xl border border-neutral-800 px-4 py-3 text-sm text-neutral-300 transition hover:border-neutral-600 hover:text-white"

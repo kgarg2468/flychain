@@ -37,9 +37,14 @@ export default async function TracesPage({ searchParams }: PageProps) {
                 Filter persisted traces by project, capability, provider, and status.
               </h1>
             </div>
-            <Link href="/" className="text-sm text-neutral-400 hover:text-white">
-              Back to workspace
-            </Link>
+            <nav className="flex flex-wrap gap-3 text-sm text-neutral-400">
+              <Link href="/chat" className="hover:text-white">
+                Chat
+              </Link>
+              <Link href="/" className="hover:text-white">
+                Back to workspace
+              </Link>
+            </nav>
           </div>
 
           <form className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">

@@ -59,5 +59,6 @@ describe('HomePage', () => {
     expect(screen.getByText('Groundedness')).toBeInTheDocument();
     expect(screen.getByText('0.81')).toBeInTheDocument();
     expect(screen.getByText('+0.210')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /chat/i })).toHaveAttribute('href', '/chat');
   });
 });

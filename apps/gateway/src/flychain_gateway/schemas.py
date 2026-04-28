@@ -92,6 +92,7 @@ class TraceRecord(BaseModel):
     method: str
     request: dict[str, Any]
     response: dict[str, Any] | None
+    capability_ids: list[str] = Field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0

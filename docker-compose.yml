@@ -89,6 +89,9 @@ services:
       FLYCHAIN_DATA_DIR: /data
       FLYCHAIN_JUDGE_MODEL: llama3.2:3b
       FLYCHAIN_EMBEDDING_MODEL: nomic-embed-text
+      FLYCHAIN_MODELS_YAML: /app/apps/gateway/src/flychain_gateway/_assets/models.yaml
+      FLYCHAIN_TEMPLATES_DIR: /app/packages/capability-compiler/src/flychain_capability_compiler/_assets/templates
+      FLYCHAIN_RECIPES_DIR: /app/packages/capability-compiler/src/flychain_capability_compiler/_assets/recipes
       FLYCHAIN_ENV: local
     ports:
       - '8080:8080'
@@ -114,9 +117,12 @@ services:
       FLYCHAIN_POSTGRES_URL: postgresql://flychain:flychain@postgres:5432/flychain
       FLYCHAIN_REDIS_URL: redis://redis:6379/0
       FLYCHAIN_OLLAMA_URL: http://ollama:11434
+      FLYCHAIN_GATEWAY_URL: http://gateway:8080
       FLYCHAIN_DATA_DIR: /data
       FLYCHAIN_JUDGE_MODEL: llama3.2:3b
       FLYCHAIN_EMBEDDING_MODEL: nomic-embed-text
+      FLYCHAIN_TEMPLATES_DIR: /app/packages/capability-compiler/src/flychain_capability_compiler/_assets/templates
+      FLYCHAIN_RECIPES_DIR: /app/packages/capability-compiler/src/flychain_capability_compiler/_assets/recipes
       FLYCHAIN_ENV: local
     volumes:
       - ./.flychain-data:/data
