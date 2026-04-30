@@ -72,6 +72,12 @@ describe('ChatClient', () => {
         usage: { prompt_tokens: 8, completion_tokens: 7, total_tokens: 15 },
       },
       traceId: 'trace_123',
+      activeAdapter: {
+        runId: 'run_mlx',
+        capabilityId: 'groundedness',
+        provider: 'local-mlx',
+        model: 'mlx-community/Llama-3.2-3B-Instruct-4bit',
+      },
     });
 
     render(<ChatClient capabilities={capabilities} loadError={null} />);
@@ -90,6 +96,12 @@ describe('ChatClient', () => {
     const assistantMessage = screen.getByText('Use the 30 day refund window.').closest('article');
     expect(within(assistantMessage as HTMLElement).getByText(/trace_123/i)).toBeInTheDocument();
     expect(within(assistantMessage as HTMLElement).getByText(/15 tokens/i)).toBeInTheDocument();
+    expect(
+      within(assistantMessage as HTMLElement).getByText(/adapter run_mlx/i),
+    ).toBeInTheDocument();
+    expect(
+      within(assistantMessage as HTMLElement).getByText(/local-mlx/i),
+    ).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /view trace/i })).toHaveAttribute(
       'href',
       '/traces?project_id=default',
