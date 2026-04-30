@@ -44,6 +44,15 @@ class ProviderRouter:
             base_url=registry.provider_base_url("local-ollama") or settings.ollama_url,
             timeout=self._timeout,
         )
+        self._mlx = (
+            OpenAICompatibleProvider(
+                name="local-mlx",
+                base_url=settings.mlx_server_url,
+                timeout=self._timeout,
+            )
+            if settings.mlx_server_url
+            else None
+        )
         self._anthropic = AnthropicProvider(
             base_url=registry.provider_base_url("anthropic") or settings.anthropic_base_url,
             timeout=self._timeout,
@@ -72,6 +81,17 @@ class ProviderRouter:
             # for Phase 1 we reject this - callers should use /v1/messages.
             raise ValueError(f"model '{model}' maps to Anthropic; use /v1/messages instead")
         raise ValueError(f"unsupported provider: {provider}")
+
+    def resolve_mlx_chat(self, model: str) -> ResolvedProvider:
+        if self._mlx is None:
+            raise RuntimeError("FLYCHAIN_MLX_SERVER_URL is required to serve active MLX adapters")
+        return ResolvedProvider(
+            provider_name="local-mlx",
+            model_id=model,
+            model_conf={"id": model},
+            adapter=self._mlx,
+            api_key=None,
+        )
 
     def resolve_messages(self, model: str) -> ResolvedProvider:
         provider, conf = self._registry.resolve(model)
