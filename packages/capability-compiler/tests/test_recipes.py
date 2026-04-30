@@ -21,7 +21,7 @@ from pydantic import ValidationError
 def test_v1_recipes_shipped() -> None:
     recipes = list_recipes()
     ids = {r.id for r in recipes}
-    assert {"sft-mlx-lora", "sft-unsloth-lora"} <= ids
+    assert {"sft-mlx-lora", "sft-unsloth-lora", "sft-mlx-lora-local-3b"} <= ids
 
 
 def test_recipe_by_id() -> None:
@@ -30,6 +30,16 @@ def test_recipe_by_id() -> None:
     assert r.method == RecipeMethod.SFT
     assert r.backend == RecipeBackend.MLX_LM
     assert r.promotion_threshold == 0.05
+
+
+def test_public_local_mlx_recipe_uses_ungated_model() -> None:
+    r = recipe_by_id("sft-mlx-lora-local-3b")
+    assert r.base_model == "mlx-community/Llama-3.2-3B-Instruct-4bit"
+    assert r.method == RecipeMethod.SFT
+    assert r.backend == RecipeBackend.MLX_LM
+    assert r.hyperparams.epochs == 3
+    assert r.hyperparams.learning_rate == 2e-5
+    assert r.hyperparams.batch_size == 1
 
 
 def test_load_recipe_from_path(tmp_path) -> None:
