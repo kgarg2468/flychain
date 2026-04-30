@@ -55,7 +55,7 @@ describe('SettingsClient', () => {
 
     await user.clear(screen.getByLabelText(/judge model/i));
     await user.type(screen.getByLabelText(/judge model/i), 'llama3.2:3b');
-    await user.click(screen.getByRole('button', { name: /save settings/i }));
+    await user.click(screen.getByRole('button', { name: /apply settings/i }));
 
     expect(gateway.updateSettings).toHaveBeenCalledWith({
       judge_model: 'llama3.2:3b',
@@ -64,6 +64,6 @@ describe('SettingsClient', () => {
       auto_eval_new_traces: false,
       auto_cluster_failures: false,
     });
-    expect(await screen.findByText(/saved to local runtime settings/i)).toBeInTheDocument();
+    expect(await screen.findByText(/applied to local runtime settings/i)).toBeInTheDocument();
   });
 });
