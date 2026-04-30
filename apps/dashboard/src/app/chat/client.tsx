@@ -6,6 +6,7 @@ import { FormEvent, useMemo, useState } from 'react';
 import {
   gateway,
   type CapabilitySpec,
+  type ChatCompletionResult,
   type ChatCompletionResponse,
   type ChatCompletionUsage,
   type ChatMessage,
@@ -23,14 +24,17 @@ interface TranscriptMessage {
   usage?: ChatCompletionUsage;
   latencyMs?: number;
   projectId?: string;
+  activeAdapter?: ChatCompletionResult['activeAdapter'];
 }
 
 export function ChatClient({
   capabilities,
   loadError,
+  embedded = false,
 }: {
   capabilities: CapabilitySpec[];
   loadError: string | null;
+  embedded?: boolean;
 }) {
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [projectId, setProjectId] = useState(DEFAULT_PROJECT);
@@ -88,6 +92,7 @@ export function ChatClient({
           latencyMs:
             typeof result.response.latency_ms === 'number' ? result.response.latency_ms : undefined,
           projectId: normalizedProject,
+          activeAdapter: result.activeAdapter,
         },
       ]);
     } catch (e) {
@@ -97,9 +102,22 @@ export function ChatClient({
     }
   }
 
-  return (
-    <main className="min-h-screen bg-[linear-gradient(180deg,_#f8fafc_0%,_#edf2f7_100%)] text-neutral-900">
-      <div className="mx-auto flex min-h-screen max-w-6xl flex-col gap-6 px-6 py-10">
+  const content = (
+    <div
+      className={
+        embedded
+          ? 'flex flex-col gap-5'
+          : 'mx-auto flex min-h-screen max-w-6xl flex-col gap-6 px-6 py-10'
+      }
+    >
+      {embedded ? (
+        <div className="flex flex-col gap-1">
+          <div className="text-xs font-semibold uppercase tracking-[0.18em] text-neutral-400">
+            Chat
+          </div>
+          <h2 className="text-xl font-semibold tracking-tight text-neutral-950">Chat</h2>
+        </div>
+      ) : (
         <header className="flex flex-col gap-4 rounded-[2rem] border border-white/80 bg-white/85 p-6 shadow-[0_20px_70px_-50px_rgba(15,23,42,0.55)] sm:flex-row sm:items-center sm:justify-between">
           <div>
             <div className="text-xs font-semibold uppercase text-neutral-400">Chat</div>
@@ -117,114 +135,124 @@ export function ChatClient({
             </Link>
           </nav>
         </header>
+      )}
 
-        {loadError ? (
-          <div className="rounded-[1.25rem] border border-red-200 bg-red-50 p-4 text-sm text-red-700">
-            <div className="font-medium">Gateway not reachable</div>
-            <div className="mt-1">{loadError}</div>
-          </div>
-        ) : null}
+      {loadError ? (
+        <div className="rounded-[1.25rem] border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+          <div className="font-medium">Gateway not reachable</div>
+          <div className="mt-1">{loadError}</div>
+        </div>
+      ) : null}
 
-        {capabilities.length === 0 ? (
-          <div className="rounded-[1.25rem] border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
-            Eval and failure workflows need a capability. You can still chat without one, or{' '}
-            <Link href="/capabilities/new" className="font-medium underline">
-              create one
-            </Link>
-            .
-          </div>
-        ) : null}
+      {capabilities.length === 0 ? (
+        <div className="rounded-[1.25rem] border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+          Eval and failure workflows need a capability. You can still chat without one, or{' '}
+          <Link href="/capabilities/new" className="font-medium underline">
+            create one
+          </Link>
+          .
+        </div>
+      ) : null}
 
-        <section className="grid flex-1 gap-6 lg:grid-cols-[340px_1fr]">
-          <form
-            onSubmit={submit}
-            className="flex flex-col gap-4 rounded-[1.5rem] border border-neutral-200 bg-white p-5 shadow-[0_18px_50px_-42px_rgba(15,23,42,0.5)]"
-          >
-            <Field label="Model" htmlFor="model">
-              <input
-                id="model"
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-                className="w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm outline-none focus:border-neutral-500"
-              />
-            </Field>
-            <Field label="Project" htmlFor="project">
-              <input
-                id="project"
-                value={projectId}
-                onChange={(event) => setProjectId(event.target.value)}
-                className="w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm outline-none focus:border-neutral-500"
-              />
-            </Field>
-            <Field label="Capability" htmlFor="capability">
-              <select
-                id="capability"
-                value={selectedCapability}
-                disabled={capabilities.length === 0}
-                onChange={(event) => setSelectedCapability(event.target.value)}
-                className="w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm outline-none focus:border-neutral-500 disabled:text-neutral-400"
-              >
-                {capabilities.length === 0 ? (
-                  <option value="">No capability</option>
-                ) : (
-                  capabilities.map((capability) => (
-                    <option key={capability.id} value={capability.id}>
-                      {capability.name}
-                    </option>
-                  ))
-                )}
-              </select>
-            </Field>
-            <Field label="Tags" htmlFor="tags">
-              <input
-                id="tags"
-                value={tags}
-                onChange={(event) => setTags(event.target.value)}
-                className="w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm outline-none focus:border-neutral-500"
-              />
-            </Field>
-            <Field label="Message" htmlFor="message">
-              <textarea
-                id="message"
-                value={draft}
-                onChange={(event) => setDraft(event.target.value)}
-                rows={7}
-                className="w-full resize-none rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm leading-6 outline-none focus:border-neutral-500"
-              />
-            </Field>
-            <button
-              type="submit"
-              disabled={isSending || !draft.trim()}
-              className="rounded-full bg-neutral-950 px-5 py-3 text-sm font-medium text-white transition hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
+      <section className="grid flex-1 gap-6 lg:grid-cols-[340px_1fr]">
+        <form
+          onSubmit={submit}
+          className="flex flex-col gap-4 rounded-[1.5rem] border border-neutral-200 bg-white p-5 shadow-[0_18px_50px_-42px_rgba(15,23,42,0.5)]"
+        >
+          <Field label="Model" htmlFor="model">
+            <input
+              id="model"
+              value={model}
+              onChange={(event) => setModel(event.target.value)}
+              className="w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm outline-none focus:border-neutral-500"
+            />
+          </Field>
+          <Field label="Project" htmlFor="project">
+            <input
+              id="project"
+              value={projectId}
+              onChange={(event) => setProjectId(event.target.value)}
+              className="w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm outline-none focus:border-neutral-500"
+            />
+          </Field>
+          <Field label="Capability" htmlFor="capability">
+            <select
+              id="capability"
+              value={selectedCapability}
+              disabled={capabilities.length === 0}
+              onChange={(event) => setSelectedCapability(event.target.value)}
+              className="w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm outline-none focus:border-neutral-500 disabled:text-neutral-400"
             >
-              {isSending ? 'Sending...' : 'Send'}
-            </button>
-            {error ? (
-              <div
-                role="alert"
-                className="rounded-2xl border border-red-200 bg-red-50 p-3 text-sm text-red-700"
-              >
-                {error}
-              </div>
-            ) : null}
-          </form>
-
-          <div className="flex min-h-[520px] flex-col rounded-[1.5rem] border border-neutral-200 bg-white shadow-[0_18px_50px_-42px_rgba(15,23,42,0.5)]">
-            <div className="border-b border-neutral-200 px-5 py-4 text-sm font-medium text-neutral-700">
-              Transcript
-            </div>
-            <div className="flex flex-1 flex-col gap-4 overflow-y-auto p-5">
-              {messages.length === 0 ? (
-                <div className="flex min-h-[360px] items-center justify-center rounded-[1.25rem] border border-dashed border-neutral-300 text-sm text-neutral-500">
-                  No messages yet.
-                </div>
+              {capabilities.length === 0 ? (
+                <option value="">No capability</option>
               ) : (
-                messages.map((message) => <MessageBubble key={message.id} message={message} />)
+                capabilities.map((capability) => (
+                  <option key={capability.id} value={capability.id}>
+                    {capability.name}
+                  </option>
+                ))
               )}
+            </select>
+          </Field>
+          <Field label="Tags" htmlFor="tags">
+            <input
+              id="tags"
+              value={tags}
+              onChange={(event) => setTags(event.target.value)}
+              className="w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm outline-none focus:border-neutral-500"
+            />
+          </Field>
+          <Field label="Message" htmlFor="message">
+            <textarea
+              id="message"
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              rows={7}
+              className="w-full resize-none rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm leading-6 outline-none focus:border-neutral-500"
+            />
+          </Field>
+          <button
+            type="submit"
+            disabled={isSending || !draft.trim()}
+            className="rounded-full bg-neutral-950 px-5 py-3 text-sm font-medium text-white transition hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {isSending ? 'Sending...' : 'Send'}
+          </button>
+          {error ? (
+            <div
+              role="alert"
+              className="rounded-2xl border border-red-200 bg-red-50 p-3 text-sm text-red-700"
+            >
+              {error}
             </div>
+          ) : null}
+        </form>
+
+        <div className="flex min-h-[520px] flex-col rounded-[1.5rem] border border-neutral-200 bg-white shadow-[0_18px_50px_-42px_rgba(15,23,42,0.5)]">
+          <div className="border-b border-neutral-200 px-5 py-4 text-sm font-medium text-neutral-700">
+            Transcript
           </div>
-        </section>
-      </div>
+          <div className="flex flex-1 flex-col gap-4 overflow-y-auto p-5">
+            {messages.length === 0 ? (
+              <div className="flex min-h-[360px] items-center justify-center rounded-[1.25rem] border border-dashed border-neutral-300 text-sm text-neutral-500">
+                No messages yet.
+              </div>
+            ) : (
+              messages.map((message) => <MessageBubble key={message.id} message={message} />)
+            )}
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+
+  if (embedded) {
+    return content;
+  }
+
+  return (
+    <main className="min-h-screen bg-[linear-gradient(180deg,_#f8fafc_0%,_#edf2f7_100%)] text-neutral-900">
+      {content}
     </main>
   );
 }
@@ -269,11 +297,17 @@ function MessageBubble({ message }: { message: TranscriptMessage }) {
         {isUser ? 'You' : 'Model'}
       </div>
       <div className="mt-2 whitespace-pre-wrap">{message.content}</div>
-      {!isUser && (message.traceId || tokenText || latencyText) ? (
+      {!isUser && (message.traceId || tokenText || latencyText || message.activeAdapter) ? (
         <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-neutral-200 pt-3 text-xs text-neutral-500">
           {message.traceId ? <span className="font-mono">{message.traceId}</span> : null}
           {tokenText ? <span>{tokenText}</span> : null}
           {latencyText ? <span>{latencyText}</span> : null}
+          {message.activeAdapter ? (
+            <span className="rounded-full bg-emerald-50 px-2 py-0.5 font-medium text-emerald-700">
+              Adapter {message.activeAdapter.runId}
+            </span>
+          ) : null}
+          {message.activeAdapter?.provider ? <span>{message.activeAdapter.provider}</span> : null}
           <Link
             href={`/traces?project_id=${encodeURIComponent(message.projectId ?? DEFAULT_PROJECT)}`}
             className="font-medium text-neutral-900 hover:underline"
