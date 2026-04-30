@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     postgres_url: str = "postgresql://flychain:flychain@localhost:5432/flychain"
     redis_url: str = "redis://localhost:6379/0"
     ollama_url: str = "http://localhost:11434"
+    mlx_server_url: str | None = None
     judge_model: str = "llama3.2:3b"
     embedding_model: str = "nomic-embed-text"
     models_yaml: str | None = None
