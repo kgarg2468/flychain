@@ -21,7 +21,7 @@ export function SettingsClient({ initial }: { initial: SettingsPayload }) {
       try {
         const response = await gateway.updateSettings(form);
         setForm(response.settings);
-        setSaved('Saved to local runtime settings.');
+        setSaved('Applied to local runtime settings.');
       } catch (e) {
         setError((e as Error).message);
       }
@@ -30,7 +30,7 @@ export function SettingsClient({ initial }: { initial: SettingsPayload }) {
 
   return (
     <div className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
-      <section className="rounded-[2rem] border border-neutral-200 bg-white p-6 shadow-[0_20px_70px_-50px_rgba(15,23,42,0.55)]">
+      <section className="rounded-xl border border-neutral-200 bg-white p-5">
         <div className="text-xs font-semibold uppercase tracking-[0.22em] text-neutral-400">
           Local Runtime Knobs
         </div>
@@ -77,14 +77,14 @@ export function SettingsClient({ initial }: { initial: SettingsPayload }) {
             disabled={isPending}
             className="rounded-full bg-neutral-950 px-5 py-3 text-sm font-medium text-white transition hover:bg-neutral-800 disabled:opacity-60"
           >
-            {isPending ? 'Saving...' : 'Save settings'}
+            {isPending ? 'Applying...' : 'Apply settings'}
           </button>
           {saved ? <span className="text-sm text-emerald-700">{saved}</span> : null}
           {error ? <span className="text-sm text-red-600">{error}</span> : null}
         </div>
       </section>
 
-      <section className="rounded-[2rem] border border-neutral-200 bg-white p-6 shadow-[0_20px_70px_-50px_rgba(15,23,42,0.55)]">
+      <section className="rounded-xl border border-neutral-200 bg-white p-5">
         <div className="text-xs font-semibold uppercase tracking-[0.22em] text-neutral-400">
           Runtime Status
         </div>
