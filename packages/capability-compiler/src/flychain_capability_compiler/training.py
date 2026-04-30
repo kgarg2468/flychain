@@ -24,6 +24,7 @@ import logging
 import platform
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -128,6 +129,17 @@ def _run_subprocess(cmd: list[str], log_file: Path) -> int:
         return int(proc.returncode or 0)
 
 
+def _stage_mlx_dataset(dataset_path: Path, output_dir: Path) -> Path:
+    """Create the data directory shape expected by ``mlx_lm.lora``."""
+    if dataset_path.is_dir() and (dataset_path / "train.jsonl").exists():
+        return dataset_path
+
+    data_dir = output_dir / "mlx-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(dataset_path, data_dir / "train.jsonl")
+    return data_dir
+
+
 class MLXLMBackend:
     """Wraps ``mlx_lm.lora`` on Apple Silicon."""
 
@@ -143,18 +155,19 @@ class MLXLMBackend:
         output_dir.mkdir(parents=True, exist_ok=True)
         adapter_dir = output_dir / "adapter"
         logs_path = output_dir / "train.log"
+        data_dir = _stage_mlx_dataset(dataset_path, output_dir)
 
         hp = recipe.hyperparams
         module = "mlx_lm.dpo" if recipe.method == RecipeMethod.DPO else "mlx_lm.lora"
         cmd = [
-            "python",
+            sys.executable,
             "-m",
             module,
             "--model",
             recipe.base_model,
             "--train",
             "--data",
-            str(dataset_path),
+            str(data_dir),
             "--adapter-path",
             str(adapter_dir),
             "--learning-rate",
@@ -166,6 +179,8 @@ class MLXLMBackend:
             "--seed",
             str(hp.seed),
         ]
+        if recipe.method == RecipeMethod.SFT:
+            cmd.append("--mask-prompt")
         rc = _run_subprocess(cmd, logs_path)
         if rc != 0:
             raise RuntimeError(f"mlx-lm training failed (rc={rc}); see {logs_path}")
