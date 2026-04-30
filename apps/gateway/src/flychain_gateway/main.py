@@ -401,6 +401,82 @@ def create_app() -> FastAPI:
             for row in (failure_map[trace_id] for trace_id in trace_ids)
         ]
 
+    def failed_trace_from_row(row: dict[str, Any]) -> FailedTrace:
+        return FailedTrace(
+            trace_id=row["trace_id"],
+            project_id=row.get("project_id") or "default",
+            input=row.get("input") or "",
+            output=row.get("output") or "",
+            context=row.get("context") or "",
+            corrected_response=row.get("corrected_response"),
+            tags=dict(row.get("tags") or {}),
+        )
+
+    async def maybe_auto_cluster_failures(
+        *, specs: list[CapabilitySpec], failed_capability_ids: set[str]
+    ) -> dict[str, Any]:
+        runtime = local_settings()
+        if not runtime.auto_cluster_failures or not failed_capability_ids:
+            return {}
+
+        cluster_store: ClusterStore = app.state.cluster_store
+        clustered: dict[str, Any] = {}
+        for spec in specs:
+            if spec.id not in failed_capability_ids:
+                continue
+            failures = [failed_trace_from_row(row) for row in derive_failures(spec.id)]
+            if not failures:
+                continue
+            result = await cluster_failures(
+                capability=spec,
+                failures=failures,
+                embedder=auto_embedder(ollama_model=runtime.embedding_model),
+                llm=auto_client(ollama_model=runtime.judge_model),
+                min_cluster_size=runtime.min_cluster_size,
+                summarize=True,
+            )
+            cluster_store.save(result)
+            clustered[spec.id] = result.as_dict()
+        return clustered
+
+    def resolve_active_mlx_adapter(capability_ids: list[str]) -> dict[str, str] | None:
+        if not capability_ids:
+            return None
+
+        settings: Settings = app.state.settings
+        adapter_store: AdapterPointerStore = app.state.adapter_pointer_store
+        run_store: TrainingRunStore = app.state.training_run_store
+        for capability_id in capability_ids:
+            active = adapter_store.get(capability_id)
+            if active is None:
+                continue
+            run_id = str(active.get("active_run_id") or "")
+            if not run_id:
+                continue
+            run = run_store.load(run_id)
+            artifact = run.artifact if run is not None else None
+            if not artifact:
+                continue
+            if artifact.get("backend") != "mlx-lm" or bool(artifact.get("dry_run")):
+                continue
+
+            adapter_dir = str(artifact.get("adapter_dir") or active.get("adapter_dir") or "")
+            base_model = str(artifact.get("base_model") or "")
+            if not adapter_dir or not base_model:
+                continue
+            if not settings.mlx_server_url:
+                raise HTTPException(
+                    status_code=503,
+                    detail="active MLX adapter is configured, but FLYCHAIN_MLX_SERVER_URL is not set",
+                )
+            return {
+                "capability_id": capability_id,
+                "run_id": run_id,
+                "adapter_dir": adapter_dir,
+                "base_model": base_model,
+            }
+        return None
+
     def resolve_cluster(capability_id: str, cluster_id: str) -> Cluster:
         cluster_store: ClusterStore = app.state.cluster_store
         stored = cluster_store.load(capability_id)
@@ -462,13 +538,21 @@ def create_app() -> FastAPI:
             default_project_id=settings.default_project_id,
         )
 
+        active_adapter = resolve_active_mlx_adapter(capability_ids)
         try:
-            resolved = router.resolve_chat(body.model)
+            if active_adapter is not None:
+                resolved = router.resolve_mlx_chat(active_adapter["base_model"])
+            else:
+                resolved = router.resolve_chat(body.model)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except (ModelNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
         payload = body.model_dump(exclude_none=True)
         payload["model"] = resolved.model_id
+        if active_adapter is not None:
+            payload["adapters"] = active_adapter["adapter_dir"]
 
         trace_id = _new_id("trace")
         tracer = get_tracer()
@@ -562,10 +646,22 @@ def create_app() -> FastAPI:
 
         response_body = dict(result.payload)
         response_body.setdefault("id", trace_id)
+        extra_headers = {
+            "x-flychain-trace-id": trace_id,
+            "x-flychain-provider": resolved.provider_name,
+            "x-flychain-model": resolved.model_id,
+        }
+        if active_adapter is not None:
+            extra_headers.update(
+                {
+                    "x-flychain-active-adapter-run-id": active_adapter["run_id"],
+                    "x-flychain-active-adapter-capability-id": active_adapter["capability_id"],
+                }
+            )
         return _json_response(
             response_body,
             status_code=result.raw_status if result.raw_status < 400 else 502,
-            extra_headers={"x-flychain-trace-id": trace_id},
+            extra_headers=extra_headers,
         )
 
     @app.post("/v1/messages")
@@ -867,10 +963,16 @@ def create_app() -> FastAPI:
         if all_scores:
             await trace_store.insert_eval_scores([s.as_dict() for s in all_scores])
 
+        auto_clusters = await maybe_auto_cluster_failures(
+            specs=specs,
+            failed_capability_ids={score.capability_id for score in all_scores if not score.passed},
+        )
+
         return {
             "trace_id": body.trace_id,
             "evaluated_capabilities": list(per_capability.keys()),
             "per_capability": per_capability,
+            "auto_clusters": auto_clusters,
         }
 
     @app.get("/debug/traces")
@@ -922,6 +1024,7 @@ def create_app() -> FastAPI:
             "runtime": {
                 "env": settings.env,
                 "ollama_url": settings.ollama_url,
+                "mlx_server_url": settings.mlx_server_url,
                 "clickhouse_url": settings.clickhouse_url,
                 "postgres_url": settings.postgres_url,
                 "redis_url": settings.redis_url,
