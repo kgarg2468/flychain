@@ -1,6 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 const GATEWAY_URL = process.env.FLYCHAIN_GATEWAY_URL ?? 'http://localhost:8080';
+const RESPONSE_HEADERS = [
+  'x-flychain-trace-id',
+  'x-flychain-active-adapter-run-id',
+  'x-flychain-active-adapter-capability-id',
+  'x-flychain-provider',
+  'x-flychain-model',
+];
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
   const body = await req.text();
@@ -23,8 +30,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   const responseHeaders: Record<string, string> = {
     'content-type': res.headers.get('content-type') ?? 'application/json',
   };
-  const traceId = res.headers.get('x-flychain-trace-id');
-  if (traceId) responseHeaders['x-flychain-trace-id'] = traceId;
+  for (const name of RESPONSE_HEADERS) {
+    const value = res.headers.get(name);
+    if (value) responseHeaders[name] = value;
+  }
 
   return new NextResponse(text, {
     status: res.status,
