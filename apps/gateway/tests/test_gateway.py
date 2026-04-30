@@ -7,6 +7,7 @@ ClickHouse is not running during unit tests.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 from flychain_gateway.main import create_app
 from flychain_gateway.settings_store import LocalSettings
+from flychain_gateway.training_store import TrainingRun
 
 
 class _MockTransport(httpx.MockTransport):
@@ -155,6 +157,98 @@ def test_chat_completions_routes_ollama(client: TestClient) -> None:
     row = traces[-1]
     assert row["provider"] == "local-ollama"
     assert row["cost_usd"] == 0.0
+
+
+def test_chat_completions_routes_active_mlx_adapter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    recorded: dict[str, Any] = {}
+    original_async_client = httpx.AsyncClient
+
+    def _dispatch(request: httpx.Request) -> httpx.Response:
+        recorded["url"] = str(request.url)
+        recorded["body"] = request.content.decode()
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-mlx",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ADAPTER_SENTINEL_OK"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+            },
+        )
+
+    def _ctor(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(_dispatch)
+        return original_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _ctor)
+    monkeypatch.setenv("FLYCHAIN_DATA_DIR", str(tmp_path / "flychain-data"))
+    monkeypatch.setenv("FLYCHAIN_CLICKHOUSE_URL", "http://localhost:1/flychain")
+    monkeypatch.setenv("FLYCHAIN_MLX_SERVER_URL", "http://mlx.test")
+
+    app = create_app()
+    with TestClient(app) as tc:
+        tc.post("/v1/capabilities/from-template", json={"template_id": "groundedness"})
+        tc.app.state.adapter_pointer_store.set_active(
+            "groundedness",
+            run_id="run_mlx",
+            adapter_dir="/tmp/flychain-adapter",
+            baseline={"groundedness": 0.1},
+            candidate={"groundedness": 0.9},
+        )
+        tc.app.state.training_run_store.save(
+            TrainingRun(
+                id="run_mlx",
+                capability_id="groundedness",
+                recipe_id="sft-mlx-lora-local-3b",
+                dataset_id="ds_demo",
+                dataset_path="/tmp/ds.jsonl",
+                status="promoted",
+                created_at="2026-04-22T00:00:00+00:00",
+                updated_at="2026-04-22T00:00:00+00:00",
+                artifact={
+                    "backend": "mlx-lm",
+                    "adapter_dir": "/tmp/flychain-adapter",
+                    "base_model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+                    "dry_run": False,
+                },
+                baseline={"groundedness": 0.1},
+                candidate={"groundedness": 0.9},
+            )
+        )
+
+        resp = tc.post(
+            "/v1/chat/completions",
+            json={
+                "model": "local-ollama:llama3.2:3b",
+                "messages": [{"role": "user", "content": "say the sentinel"}],
+            },
+            headers={"x-flychain-capabilities": "groundedness"},
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert recorded["url"] == "http://mlx.test/v1/chat/completions"
+        sent_body = json.loads(recorded["body"])
+        assert sent_body["model"] == "mlx-community/Llama-3.2-3B-Instruct-4bit"
+        assert sent_body["adapters"] == "/tmp/flychain-adapter"
+        assert resp.headers["x-flychain-active-adapter-run-id"] == "run_mlx"
+        assert resp.headers["x-flychain-active-adapter-capability-id"] == "groundedness"
+        assert resp.headers["x-flychain-provider"] == "local-mlx"
+
+        traces = tc.get("/debug/traces").json()
+        row = traces[-1]
+        assert row["provider"] == "local-mlx"
+        assert row["model"] == "mlx-community/Llama-3.2-3B-Instruct-4bit"
+        assert row["request"]["adapters"] == "/tmp/flychain-adapter"
 
 
 def test_chat_completions_unknown_model(client: TestClient) -> None:
