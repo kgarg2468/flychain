@@ -24,6 +24,10 @@ describe('POST /api/chat/completions', () => {
           headers: {
             'content-type': 'application/json',
             'x-flychain-trace-id': 'trace_route_1',
+            'x-flychain-active-adapter-run-id': 'run_mlx',
+            'x-flychain-active-adapter-capability-id': 'groundedness',
+            'x-flychain-provider': 'local-mlx',
+            'x-flychain-model': 'mlx-community/Llama-3.2-3B-Instruct-4bit',
           },
         },
       ),
@@ -65,6 +69,12 @@ describe('POST /api/chat/completions', () => {
     });
     expect(response.status).toBe(200);
     expect(response.headers.get('x-flychain-trace-id')).toBe('trace_route_1');
+    expect(response.headers.get('x-flychain-active-adapter-run-id')).toBe('run_mlx');
+    expect(response.headers.get('x-flychain-active-adapter-capability-id')).toBe('groundedness');
+    expect(response.headers.get('x-flychain-provider')).toBe('local-mlx');
+    expect(response.headers.get('x-flychain-model')).toBe(
+      'mlx-community/Llama-3.2-3B-Instruct-4bit',
+    );
     expect(headersRecord(response.headers)['content-type']).toContain('application/json');
     await expect(response.json()).resolves.toMatchObject({
       id: 'chatcmpl_1',
