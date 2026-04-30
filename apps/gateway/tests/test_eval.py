@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from flychain_gateway import main as gw_main
+from flychain_gateway.schemas import TraceRecord
+from flychain_gateway.settings_store import LocalSettings
 
 
 class FakeLLM:
@@ -24,6 +28,14 @@ class FakeLLM:
         if not self._responses:
             raise AssertionError("FakeLLM: out of responses")
         return self._responses.pop(0)
+
+
+class FakeEmbedder:
+    provider = "fake"
+    model = "fake"
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[float(i), float(i)] for i, _text in enumerate(texts)]
 
 
 @pytest.fixture
@@ -51,6 +63,29 @@ def _mk_groundedness(client: TestClient) -> None:
         json={"template_id": "groundedness"},
     )
     assert resp.status_code == 201, resp.text
+
+
+def _seed_trace(client: TestClient, trace_id: str, *, tags: dict[str, str] | None = None) -> None:
+    store = client.app.state.trace_store
+    asyncio.run(
+        store.insert_trace(
+            TraceRecord(
+                trace_id=trace_id,
+                project_id="p1",
+                provider="openai",
+                model="gpt-4o-mini",
+                method="chat.completions",
+                request={"messages": [{"role": "user", "content": "What does page 12 say?"}]},
+                response={
+                    "choices": [
+                        {"message": {"content": "Page 12 says onboarding is manual."}}
+                    ]
+                },
+                status="ok",
+                tags=tags or {"task": "rag"},
+            )
+        )
+    )
 
 
 def test_eval_returns_scores_for_matching_capability(client: TestClient) -> None:
@@ -129,3 +164,90 @@ def test_eval_runs_all_tracked_capabilities_by_default(client: TestClient) -> No
     body = resp.json()
     # Groundedness matches via tag rule; instruction-following via semantic rule (always-match in v1).
     assert set(body["evaluated_capabilities"]) == {"groundedness", "instruction-following"}
+
+
+def test_eval_auto_clusters_new_failures_when_enabled(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _mk_groundedness(client)
+    _seed_trace(client, "trace-auto-cluster")
+    client.app.state.local_settings_store.save(
+        LocalSettings(auto_cluster_failures=True, min_cluster_size=3)
+    )
+
+    def _failing_client(*_args: Any, **_kwargs: Any) -> FakeLLM:
+        return FakeLLM([0.2, 0.3, 0.4, 0.9])
+
+    monkeypatch.setattr(gw_main, "auto_client", _failing_client)
+    monkeypatch.setattr(gw_main, "auto_embedder", lambda *_args, **_kwargs: FakeEmbedder())
+
+    resp = client.post(
+        "/v1/eval",
+        json={
+            "trace_id": "trace-auto-cluster",
+            "project_id": "p1",
+            "input": "What does page 12 say?",
+            "output": "Page 12 says onboarding is manual.",
+            "context": "Page 12: onboarding is self-serve.",
+            "tags": {"task": "rag"},
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    clusters = client.get("/v1/capabilities/groundedness/clusters").json()
+    assert clusters["clusters"]
+    assert clusters["clusters"][0]["trace_ids"] == ["trace-auto-cluster"]
+
+
+def test_eval_does_not_auto_cluster_when_disabled(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _mk_groundedness(client)
+    _seed_trace(client, "trace-no-cluster")
+
+    def _failing_client(*_args: Any, **_kwargs: Any) -> FakeLLM:
+        return FakeLLM([0.2, 0.3, 0.4])
+
+    monkeypatch.setattr(gw_main, "auto_client", _failing_client)
+    monkeypatch.setattr(gw_main, "auto_embedder", lambda *_args, **_kwargs: FakeEmbedder())
+
+    resp = client.post(
+        "/v1/eval",
+        json={
+            "trace_id": "trace-no-cluster",
+            "project_id": "p1",
+            "input": "What does page 12 say?",
+            "output": "Page 12 says onboarding is manual.",
+            "context": "Page 12: onboarding is self-serve.",
+            "tags": {"task": "rag"},
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    clusters = client.get("/v1/capabilities/groundedness/clusters").json()
+    assert clusters["clusters"] == []
+
+
+def test_eval_does_not_auto_cluster_passing_scores(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _mk_groundedness(client)
+    _seed_trace(client, "trace-passing")
+    client.app.state.local_settings_store.save(LocalSettings(auto_cluster_failures=True))
+    monkeypatch.setattr(gw_main, "auto_embedder", lambda *_args, **_kwargs: FakeEmbedder())
+
+    resp = client.post(
+        "/v1/eval",
+        json={
+            "trace_id": "trace-passing",
+            "project_id": "p1",
+            "input": "What does page 12 say about onboarding?",
+            "output": "Page 12 says onboarding is self-serve.",
+            "context": "Page 12: Users onboard via self-serve signup.",
+            "tags": {"task": "rag"},
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    clusters = client.get("/v1/capabilities/groundedness/clusters").json()
+    assert clusters["clusters"] == []
