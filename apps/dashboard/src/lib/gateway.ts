@@ -192,6 +192,7 @@ export interface SettingsPayload {
   runtime?: {
     env: string;
     ollama_url: string;
+    mlx_server_url?: string | null;
     clickhouse_url: string;
     postgres_url: string;
     redis_url: string;
@@ -241,6 +242,12 @@ export interface ChatCompletionArgs {
 export interface ChatCompletionResult {
   response: ChatCompletionResponse;
   traceId: string | null;
+  activeAdapter?: {
+    runId: string;
+    capabilityId: string;
+    provider: string | null;
+    model: string | null;
+  };
 }
 
 function gatewayBaseUrl(): string {
@@ -249,8 +256,15 @@ function gatewayBaseUrl(): string {
   return 'http://localhost:8080';
 }
 
+function requestUrl(path: string): string {
+  if (typeof window !== 'undefined') {
+    return `/api/gateway${path}`;
+  }
+  return `${gatewayBaseUrl()}${path}`;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${gatewayBaseUrl()}${path}`, {
+  const res = await fetch(requestUrl(path), {
     cache: 'no-store',
     ...init,
     headers: {
@@ -289,9 +303,20 @@ export const gateway = {
     if (!res.ok) {
       throw new Error(`gateway ${res.status}: ${await res.text()}`);
     }
+    const runId = res.headers.get('x-flychain-active-adapter-run-id');
+    const capabilityId = res.headers.get('x-flychain-active-adapter-capability-id');
     return {
       response: (await res.json()) as ChatCompletionResponse,
       traceId: res.headers.get('x-flychain-trace-id'),
+      activeAdapter:
+        runId && capabilityId
+          ? {
+              runId,
+              capabilityId,
+              provider: res.headers.get('x-flychain-provider'),
+              model: res.headers.get('x-flychain-model'),
+            }
+          : undefined,
     };
   },
   async listCapabilities(): Promise<CapabilitySpec[]> {
