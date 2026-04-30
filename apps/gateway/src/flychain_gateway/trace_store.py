@@ -47,6 +47,7 @@ class TraceStore:
         self.url = url
         self._client: Any | None = None
         self._lock = threading.Lock()
+        self._client_lock = threading.Lock()
         self._buffer = _Buffer()
 
     # -- lifecycle -------------------------------------------------------
@@ -54,36 +55,44 @@ class TraceStore:
     def connect(self) -> None:
         if self._client is not None or clickhouse_connect is None:
             return
-        parsed = urlparse(self.url)
-        scheme = parsed.scheme or "http"
-        host = parsed.hostname or "localhost"
-        port = parsed.port or (8443 if scheme == "https" else 8123)
-        user = parsed.username or "default"
-        password = parsed.password or ""
-        database = parsed.path.lstrip("/") or "flychain"
-        try:
-            self._client = clickhouse_connect.get_client(
-                host=host,
-                port=port,
-                username=user,
-                password=password,
-                database=database,
-                interface=scheme,
-                compress=False,
-                connect_timeout=2,
-                query_limit=0,
-            )
-            self._client.ping()
-        except Exception as exc:  # pragma: no cover - depends on env
-            logger.warning("ClickHouse unavailable (%s); falling back to in-memory buffer", exc)
-            self._client = None
+        with self._client_lock:
+            if self._client is not None:
+                return
+            parsed = urlparse(self.url)
+            scheme = parsed.scheme or "http"
+            host = parsed.hostname or "localhost"
+            port = parsed.port or (8443 if scheme == "https" else 8123)
+            user = parsed.username or "default"
+            password = parsed.password or ""
+            database = parsed.path.lstrip("/") or "flychain"
+            try:
+                client = clickhouse_connect.get_client(
+                    host=host,
+                    port=port,
+                    username=user,
+                    password=password,
+                    database=database,
+                    interface=scheme,
+                    compress=False,
+                    connect_timeout=2,
+                    query_limit=0,
+                )
+                client.ping()
+                self._client = client
+            except Exception as exc:  # pragma: no cover - depends on env
+                logger.warning(
+                    "ClickHouse unavailable (%s); falling back to in-memory buffer",
+                    exc,
+                )
+                self._client = None
 
     def close(self) -> None:
-        client = self._client
-        self._client = None
-        if client is not None:
-            with contextlib.suppress(Exception):  # pragma: no cover
-                client.close()
+        with self._client_lock:
+            client = self._client
+            self._client = None
+            if client is not None:
+                with contextlib.suppress(Exception):  # pragma: no cover
+                    client.close()
 
     # -- writes ----------------------------------------------------------
 
@@ -193,17 +202,19 @@ class TraceStore:
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
-        rows = self._merge_rows(
-            persisted=self._normalize_traces(
-                self._query_rows(
-                    "SELECT trace_id, span_id, parent_span_id, project_id, capability_ids, "
-                    "provider, model, method, request, response, prompt_tokens, "
-                    "completion_tokens, total_tokens, cost_usd, latency_ms, status, error, "
-                    "tags, ts FROM traces"
-                )
-            ),
-            buffered=self.buffered_traces(),
-            key=lambda row: (row["trace_id"], row["project_id"], row["method"]),
+        rows = self._normalize_traces(
+            self._merge_rows(
+                persisted=self._normalize_traces(
+                    self._query_rows(
+                        "SELECT trace_id, span_id, parent_span_id, project_id, capability_ids, "
+                        "provider, model, method, request, response, prompt_tokens, "
+                        "completion_tokens, total_tokens, cost_usd, latency_ms, status, error, "
+                        "tags, ts FROM traces"
+                    )
+                ),
+                buffered=self.buffered_traces(),
+                key=lambda row: (row["trace_id"], row["project_id"], row["method"]),
+            )
         )
 
         if project_id is not None:
@@ -241,7 +252,8 @@ class TraceStore:
         if client is None:
             return []
         try:
-            result = client.query(sql)
+            with self._client_lock:
+                result = client.query(sql)
         except Exception as exc:  # pragma: no cover - env dependent
             logger.warning("ClickHouse query failed: %s", exc)
             return []
@@ -294,54 +306,55 @@ class TraceStore:
         if not rows:
             return
         try:
-            client.insert(
-                "traces",
-                [
+            with self._client_lock:
+                client.insert(
+                    "traces",
                     [
-                        r["trace_id"],
-                        r["span_id"],
-                        r["parent_span_id"],
-                        r["project_id"],
-                        r["capability_ids"],
-                        r["provider"],
-                        r["model"],
-                        r["method"],
-                        r["request"],
-                        r["response"],
-                        r["prompt_tokens"],
-                        r["completion_tokens"],
-                        r["total_tokens"],
-                        r["cost_usd"],
-                        r["latency_ms"],
-                        r["status"],
-                        r["error"],
-                        r["tags"],
-                        r["ts"],
-                    ]
-                    for r in rows
-                ],
-                column_names=[
-                    "trace_id",
-                    "span_id",
-                    "parent_span_id",
-                    "project_id",
-                    "capability_ids",
-                    "provider",
-                    "model",
-                    "method",
-                    "request",
-                    "response",
-                    "prompt_tokens",
-                    "completion_tokens",
-                    "total_tokens",
-                    "cost_usd",
-                    "latency_ms",
-                    "status",
-                    "error",
-                    "tags",
-                    "ts",
-                ],
-            )
+                        [
+                            r["trace_id"],
+                            r["span_id"],
+                            r["parent_span_id"],
+                            r["project_id"],
+                            r["capability_ids"],
+                            r["provider"],
+                            r["model"],
+                            r["method"],
+                            r["request"],
+                            r["response"],
+                            r["prompt_tokens"],
+                            r["completion_tokens"],
+                            r["total_tokens"],
+                            r["cost_usd"],
+                            r["latency_ms"],
+                            r["status"],
+                            r["error"],
+                            r["tags"],
+                            r["ts"],
+                        ]
+                        for r in rows
+                    ],
+                    column_names=[
+                        "trace_id",
+                        "span_id",
+                        "parent_span_id",
+                        "project_id",
+                        "capability_ids",
+                        "provider",
+                        "model",
+                        "method",
+                        "request",
+                        "response",
+                        "prompt_tokens",
+                        "completion_tokens",
+                        "total_tokens",
+                        "cost_usd",
+                        "latency_ms",
+                        "status",
+                        "error",
+                        "tags",
+                        "ts",
+                    ],
+                )
         except Exception as exc:
             logger.warning("ClickHouse trace insert failed: %s", exc)
             with self._lock:
@@ -358,34 +371,35 @@ class TraceStore:
         if not rows:
             return
         try:
-            client.insert(
-                "eval_scores",
-                [
+            with self._client_lock:
+                client.insert(
+                    "eval_scores",
                     [
-                        r["trace_id"],
-                        r["project_id"],
-                        r["capability_id"],
-                        r["dimension"],
-                        r["score"],
-                        r["passed"],
-                        r["reason"],
-                        r["judge_model"],
-                        r["ts"],
-                    ]
-                    for r in rows
-                ],
-                column_names=[
-                    "trace_id",
-                    "project_id",
-                    "capability_id",
-                    "dimension",
-                    "score",
-                    "passed",
-                    "reason",
-                    "judge_model",
-                    "ts",
-                ],
-            )
+                        [
+                            r["trace_id"],
+                            r["project_id"],
+                            r["capability_id"],
+                            r["dimension"],
+                            r["score"],
+                            r["passed"],
+                            r["reason"],
+                            r["judge_model"],
+                            r["ts"],
+                        ]
+                        for r in rows
+                    ],
+                    column_names=[
+                        "trace_id",
+                        "project_id",
+                        "capability_id",
+                        "dimension",
+                        "score",
+                        "passed",
+                        "reason",
+                        "judge_model",
+                        "ts",
+                    ],
+                )
         except Exception as exc:
             logger.warning("ClickHouse eval_scores insert failed: %s", exc)
             with self._lock:
@@ -402,32 +416,33 @@ class TraceStore:
         if not rows:
             return
         try:
-            client.insert(
-                "feedback",
-                [
+            with self._client_lock:
+                client.insert(
+                    "feedback",
                     [
-                        r["feedback_id"],
-                        r["trace_id"],
-                        r["project_id"],
-                        r["score"],
-                        r["thumb"],
-                        r["comment"],
-                        r["corrected_response"],
-                        r["ts"],
-                    ]
-                    for r in rows
-                ],
-                column_names=[
-                    "feedback_id",
-                    "trace_id",
-                    "project_id",
-                    "score",
-                    "thumb",
-                    "comment",
-                    "corrected_response",
-                    "ts",
-                ],
-            )
+                        [
+                            r["feedback_id"],
+                            r["trace_id"],
+                            r["project_id"],
+                            r["score"],
+                            r["thumb"],
+                            r["comment"],
+                            r["corrected_response"],
+                            r["ts"],
+                        ]
+                        for r in rows
+                    ],
+                    column_names=[
+                        "feedback_id",
+                        "trace_id",
+                        "project_id",
+                        "score",
+                        "thumb",
+                        "comment",
+                        "corrected_response",
+                        "ts",
+                    ],
+                )
         except Exception as exc:
             logger.warning("ClickHouse feedback insert failed: %s", exc)
             with self._lock:
