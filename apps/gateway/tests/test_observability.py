@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -63,6 +65,37 @@ class FakeClickHouseClient:
         else:
             table = "eval_scores"
         return FakeQueryResult(self.tables.get(table, []))
+
+
+class ConcurrentRejectingClickHouseClient(FakeClickHouseClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self._operation_lock = threading.Lock()
+        self.concurrent_errors = 0
+
+    def _enter_operation(self) -> None:
+        if not self._operation_lock.acquire(blocking=False):
+            self.concurrent_errors += 1
+            raise RuntimeError("concurrent query on same session")
+
+    def _leave_operation(self) -> None:
+        self._operation_lock.release()
+
+    def insert(self, table: str, rows: list[list[Any]], column_names: list[str]) -> None:
+        self._enter_operation()
+        try:
+            time.sleep(0.05)
+            super().insert(table, rows, column_names)
+        finally:
+            self._leave_operation()
+
+    def query(self, sql: str) -> FakeQueryResult:
+        self._enter_operation()
+        try:
+            time.sleep(0.05)
+            return super().query(sql)
+        finally:
+            self._leave_operation()
 
 
 @pytest.fixture
@@ -164,6 +197,36 @@ def test_traces_endpoint_filters_by_project_and_capability(client: TestClient) -
     body = resp.json()
     assert body["total"] == 1
     assert [t["trace_id"] for t in body["traces"]] == ["trace-a"]
+
+
+def test_trace_store_serializes_clickhouse_client_operations(client: TestClient) -> None:
+    store = client.app.state.trace_store
+    fake = ConcurrentRejectingClickHouseClient()
+    store._client = fake  # noqa: SLF001
+
+    async def _insert_and_read() -> None:
+        insert_task = asyncio.create_task(
+            store.insert_trace(
+                TraceRecord(
+                    trace_id="trace-concurrent",
+                    project_id="proj-a",
+                    provider="openai",
+                    model="gpt-4o-mini",
+                    method="chat.completions",
+                    request={"messages": [{"role": "user", "content": "hi"}]},
+                    response={"choices": [{"message": {"content": "hello"}}]},
+                    status="ok",
+                    tags={"task": "chat"},
+                )
+            )
+        )
+        await asyncio.sleep(0.01)
+        await asyncio.to_thread(store.list_traces)
+        await insert_task
+
+    asyncio.run(_insert_and_read())
+
+    assert fake.concurrent_errors == 0
 
 
 def test_settings_endpoint_is_env_first_and_persists_local_knobs(client: TestClient) -> None:
