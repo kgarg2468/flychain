@@ -57,6 +57,7 @@ artifacts/
 models/
 adapters/
 .flychain-data/
+.flychain-phase1-e2e-*/
 *.gguf
 *.safetensors
 *.bin

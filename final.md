@@ -536,6 +536,66 @@ Phase 1 is complete when:
 - job failures and timeouts are visible;
 - tests prove the previous E2E mistakes cannot recur.
 
+## Phase 1 End-To-End Testing Gate
+
+### Purpose
+
+Prove that FlyChain's core safety decisions are trustworthy before adding more UI automation. By the end of this gate, an operator should know that deterministic failures cannot be missed, broken adapters cannot become active, and background work is observable when it fails.
+
+### Required Starting State
+
+- Run the real local FlyChain stack: dashboard, gateway, orchestrator, Redis, ClickHouse, Ollama, and MLX server.
+- Use a fresh test capability named `phase1-exact-sentinel` or an equivalent isolated capability.
+- Configure the capability with a deterministic exact-match evaluator requiring the output `PHASE1_SENTINEL_OK`.
+- Enable `auto_eval_new_traces` and `auto_cluster_failures`.
+- Ensure the dashboard can reach the gateway through the same-origin proxy.
+- Ensure the operator can inspect job status from the dashboard or API without reading worker logs directly.
+
+### Operator Actions
+
+1. Send a baseline chat request for the capability that should fail, such as `Return the Phase 1 sentinel token only.`
+2. Force the model or request to return a fake but plausible wrong value, such as `0xabc123` or `PHASE1_SENTINEL_BAD`.
+3. Confirm the trace is captured with the target capability id and provider/model metadata.
+4. Wait for auto-eval to complete.
+5. Inspect the failure record and verify the deterministic evaluator produced the failure, not the LLM judge.
+6. Add a corrected response of `PHASE1_SENTINEL_OK`.
+7. Create enough corrected failures to build a small SFT dataset.
+8. Train a real MLX adapter or use an existing trained adapter artifact only if it was created by the real local MLX backend.
+9. Try to promote or activate the adapter before served validation has passed.
+10. Run served adapter validation through the actual chat-serving path.
+11. Confirm the validation request includes the capability header and that the response uses the expected adapter run id.
+12. Force one controlled background job failure, such as temporarily pointing the validation call at an unavailable MLX server or using a known invalid job input.
+13. Restore the service/input and verify retry or manual retry behavior is visible.
+
+### Expected Evidence
+
+- The wrong fake token fails with a deterministic exact-match reason.
+- The eval result records the deterministic evaluator type/source.
+- The failure appears in the capability's failure list with the trace id, prompt, wrong output, failing dimension, and correction status.
+- Auto-cluster either creates a cluster or records that clustering was attempted and why it did not create one.
+- Promotion is blocked before served validation passes.
+- Served validation sends a real request through the gateway chat path, not an offline score shortcut.
+- Served validation records provider, model, active adapter run id, active adapter capability id, response output, eval result, and pass/fail status.
+- Promotion succeeds only after served validation passes.
+- The active adapter pointer matches the validated run id.
+- The controlled job failure is visible as failed, timed out, or retrying with an error message, retry count, and timestamp.
+- After recovery, the job can be retried or a new job can complete without requiring database or log inspection.
+
+### Failure Signals
+
+- A fake token passes an exact-match capability.
+- The system calls an LLM judge for a deterministic exact-match dimension.
+- Failure records are missing trace ids, evaluator reasons, or correction status.
+- Promotion can activate an adapter without served validation.
+- Served validation does not prove the adapter run id through response metadata.
+- A validation response comes from the base provider instead of the adapter provider and still passes.
+- Job failures only appear in terminal logs and are not visible through product state.
+- Retried jobs create duplicate active pointers, duplicate datasets, or confusing status.
+
+### Go / No-Go Decision
+
+Go to Phase 2 only if every core safety claim is backed by inspectable product evidence: deterministic wrong outputs fail, failed traces are visible, broken or unvalidated adapters cannot be activated, served validation proves the adapter path, and background job failures are visible with retry status. If any of those fail, fix Phase 1 before building more UI or automation.
+
 ---
 
 # Phase 2: Visibility And Operator UI
@@ -713,6 +773,67 @@ Required tests:
 
 Phase 2 is complete when a user can understand the full state of a capability without using curl, logs, local files, or database inspection.
 
+## Phase 2 End-To-End Testing Gate
+
+### Purpose
+
+Prove that an operator can understand the complete FlyChain loop from the dashboard alone. By the end of this gate, a user should be able to explain what happened to a capability, what improved, what failed, what is active, and what needs attention without using curl, local files, database tools, or worker logs.
+
+### Required Starting State
+
+- Run the real local FlyChain stack with dashboard, gateway, orchestrator, Redis, ClickHouse, Ollama, and MLX server available.
+- Use a capability that has at least one trace, one failed eval, one correction, one cluster, one dataset, one training run, one served validation result, and one active adapter.
+- Keep at least one unresolved failure and one failed or timed-out job available so the UI has both healthy and unhealthy states to show.
+- Open the dashboard at the one-page workspace URL.
+- Do not use command-line API calls, database inspection, or local file inspection during the gate except to recover the test environment if it is down.
+
+### Operator Actions
+
+1. Open the Capabilities tab and select the test capability.
+2. Confirm the capability summary shows trace counts, evaluated counts, failing counts, correction coverage, cluster count, dataset count, training run count, served validation status, and active adapter status.
+3. Open the flywheel timeline or equivalent lifecycle view.
+4. Walk through each lifecycle step: capture traces, evaluate, detect failures, collect corrections, cluster, synthesize dataset, train, validate served adapter, promote, and serve active adapter.
+5. Open the failure inbox and inspect a failed trace.
+6. Confirm the failure view shows prompt, bad output, failing dimension, evaluator reason, corrected response state, cluster membership, and dataset eligibility.
+7. Open the cluster view and inspect at least one cluster.
+8. Confirm the cluster view shows label, size, representative examples, trace ids, correction coverage, readiness, and any dataset created from it.
+9. Open the dataset view and inspect the dataset that trained the active adapter.
+10. Confirm the dataset view shows dataset id, source cluster, row count, method, correction source, path, and training runs created from it.
+11. Open the training run view and inspect the active run.
+12. Confirm the run view distinguishes trained, offline gate result, served validation result, promoted, and active states.
+13. Open Chat, select or apply the same capability, and send a prompt that should use the active adapter.
+14. Confirm the chat response shows trace id, provider, model, capability id, active adapter run id, and pass/fail status if evaluated.
+15. Open the before/after comparison and compare the baseline output against the adapted output for the same prompt.
+16. Navigate directly to old deep links for Chat, Traces, Settings, and capability detail.
+17. Confirm each deep link lands on the correct workspace tab or selected state.
+
+### Expected Evidence
+
+- The user can trace one capability's full history from raw trace to active adapter inside the dashboard.
+- Counts and statuses match across the summary, timeline, and detail panels.
+- Failures have enough context to decide whether they need correction, clustering, or exclusion.
+- Clusters show whether they are ready for dataset synthesis.
+- Datasets show their source cluster and downstream training runs.
+- Training runs show the difference between trained, validated, promoted, and active.
+- Chat responses expose adapter proof metadata when an active adapter is used.
+- Before/after comparison shows the same prompt, baseline output, adapted output, evaluator scores, served adapter metadata, and final verdict.
+- Settings show relevant runtime health for gateway, background jobs, ClickHouse, Redis, Ollama, and MLX server.
+- Old routes and query links do not strand the operator on stale or disconnected pages.
+
+### Failure Signals
+
+- The operator must use curl, logs, files, or database tools to understand the loop.
+- Counts disagree between tabs or panels without explanation.
+- The UI hides whether a training run is merely trained versus actually served-validated.
+- Chat output does not show adapter metadata when an adapter is active.
+- A failed job or failed validation is invisible from the dashboard.
+- Deep links land on old pages that do not show the connected workspace state.
+- The UI shows actions without explaining whether prerequisites are satisfied.
+
+### Go / No-Go Decision
+
+Go to Phase 3 only if the dashboard itself can explain the complete lifecycle and current state of a capability. If an operator still needs terminal commands or local file inspection to understand traces, failures, clusters, datasets, runs, validation, or active adapter proof, Phase 2 is not complete.
+
 ---
 
 # Phase 3: Human-In-The-Loop Automation
@@ -837,6 +958,71 @@ Required tests:
 ## Phase 3 Done Means
 
 Phase 3 is complete when a user can run the full repair loop from the UI with guided clicks, while FlyChain still requires explicit human approval before training and promotion.
+
+## Phase 3 End-To-End Testing Gate
+
+### Purpose
+
+Prove that FlyChain can guide a human through the complete repair loop without manual API calls. By the end of this gate, the happy path should be one-click or guided from the dashboard, but training and promotion should still require explicit human approval.
+
+### Required Starting State
+
+- Run the real local FlyChain stack with dashboard, gateway, orchestrator, Redis, ClickHouse, Ollama, and MLX server available.
+- Use a fresh capability named `phase3-guided-sentinel` or equivalent.
+- Configure the capability with a deterministic evaluator so success is unambiguous.
+- Start with no dataset, no training run, no served validation, and no active adapter for this capability.
+- Keep autopilot disabled for the capability.
+- Ensure the UI can create corrections, synthesize datasets, start training, run served validation, and promote through guided actions.
+
+### Operator Actions
+
+1. In Chat, send several prompts that should fail for the capability.
+2. Let auto-eval run and confirm the failure inbox populates.
+3. Add corrected responses from the UI for enough failures to meet the readiness threshold.
+4. Confirm the dashboard suggests creating a dataset from the ready cluster or selected failures.
+5. Click the suggested dataset action.
+6. Review the dataset summary before creation if the UI provides a confirmation step.
+7. Create the dataset and confirm row count, skipped rows, and source failures are shown.
+8. Confirm the dashboard suggests starting training from the dataset.
+9. Click the training suggestion.
+10. Verify the UI shows selected recipe, backend, dry-run/real status, fallback policy, expected inputs, and active runtime requirements before queueing.
+11. Explicitly approve the training run.
+12. Wait for training to complete while watching job status in the dashboard.
+13. Confirm the dashboard suggests served validation for the trained run.
+14. Click the served validation suggestion and verify it uses the real chat-serving path.
+15. Confirm served validation records adapter proof metadata and eval results.
+16. Confirm the dashboard suggests promotion only after validation passes.
+17. Explicitly approve promotion.
+18. Send a final chat prompt with the capability selected and verify the active adapter is used.
+
+### Expected Evidence
+
+- The dashboard suggests the next correct action at each step and explains why.
+- The operator does not need to call APIs manually for dataset creation, training, validation, or promotion.
+- Dataset creation uses corrected failures and shows included and skipped examples.
+- Training cannot start from zero corrected failures.
+- Training approval shows whether the backend is real MLX or dry-run.
+- Real-adapter mode does not silently fall back to dry-run.
+- Training job progress, completion, and errors are visible from the UI.
+- Served validation uses the actual adapter-serving path and records proof headers.
+- Promotion is unavailable until served validation passes.
+- Promotion requires explicit approval and shows the current active adapter before replacing it.
+- Final chat uses the newly active adapter and shows trace id, provider, model, and active adapter run id.
+
+### Failure Signals
+
+- The user has to use curl or scripts to move from failures to dataset, dataset to training, training to validation, or validation to promotion.
+- Suggested actions appear before prerequisites are met.
+- Training can start with no corrected failures.
+- The UI hides whether training is real MLX or dry-run.
+- Served validation can be skipped.
+- Promotion can occur without explicit approval.
+- The active adapter changes without showing what was replaced.
+- The final chat response does not show adapter proof metadata.
+
+### Go / No-Go Decision
+
+Go to Phase 4 only if a user can complete the repair loop through guided dashboard actions, with no manual API glue, while still explicitly approving training and promotion. If the workflow still depends on hidden commands or allows unsafe shortcuts, Phase 3 is not complete.
 
 ---
 
@@ -986,6 +1172,78 @@ Required tests:
 ## Phase 4 Done Means
 
 Phase 4 is complete when FlyChain can safely run the full loop automatically under explicit policy, with visible status, auditability, served validation, and rollback.
+
+## Phase 4 End-To-End Testing Gate
+
+### Purpose
+
+Prove that FlyChain can run the full self-driving repair loop under explicit policy with real local software, real MLX training, served-adapter validation, auditability, and rollback. By the end of this gate, the operator should know whether the system can move from failures and corrections to an active adapter without hidden manual glue.
+
+### Required Starting State
+
+- Run the full real local stack: dashboard, gateway, orchestrator, Redis, ClickHouse, Ollama, and MLX server.
+- Use a fresh capability named `phase4-autopilot-sentinel` or equivalent.
+- Configure deterministic eval for exact expected output, such as `PHASE4_SENTINEL_OK`.
+- Enable an autopilot policy only for this test capability.
+- Policy should allow dataset creation, real MLX training, served validation, and promotion according to explicit thresholds.
+- Policy should require enough corrected failures before training.
+- Policy should disallow dry-run fallback for the final readiness run.
+- Policy should require served validation before promotion.
+- Policy should either require human approval for promotion or explicitly enable auto-promotion for this test.
+- Ensure rollback is available and there is either no prior active adapter or a known previous active adapter to restore.
+
+### Operator Actions
+
+1. Enable the capability's autopilot policy from the UI.
+2. Send several chat prompts that intentionally produce failing traces.
+3. Add corrected responses, or use the configured correction path if the policy allows generated corrections.
+4. Watch autopilot readiness state until thresholds are met.
+5. Verify autopilot creates or selects the failure cluster only after readiness criteria are satisfied.
+6. Verify autopilot synthesizes a dataset from eligible corrected failures.
+7. Verify autopilot queues a real MLX training run using an allowed recipe.
+8. Wait for training to complete and confirm the run artifact points to a real adapter directory.
+9. Verify autopilot runs served validation through the actual gateway chat-serving path.
+10. Verify validation checks adapter proof headers, output correctness, and capability eval.
+11. If policy requires approval, approve promotion from the UI after reviewing validation evidence.
+12. If policy allows auto-promotion, verify promotion happens only after served validation passes.
+13. Send a final chat prompt and verify the active adapter responds correctly with proof metadata.
+14. Trigger a controlled failure path, such as insufficient corrected failures, disabled backend, failed served validation, or policy cooldown.
+15. Confirm autopilot records why it did not proceed.
+16. Test rollback by restoring the previous active adapter or disabling the new active adapter.
+17. Confirm the audit log shows the trigger, policy version, actions taken, skipped actions, job ids, outcomes, and any human approvals.
+
+### Expected Evidence
+
+- Autopilot waits for policy thresholds instead of acting on every trace.
+- Dataset creation includes only eligible examples and records skipped examples with reasons.
+- Training uses a real MLX backend for the final readiness run.
+- No dry-run fallback occurs when policy forbids it.
+- Served validation happens after training and before promotion.
+- Served validation proves the response used the expected adapter run id and capability id.
+- Promotion follows the configured policy exactly.
+- Auto-promotion, if enabled, occurs only after validation passes.
+- The active adapter pointer matches the promoted run.
+- Final chat uses the active adapter and returns the expected output.
+- Rollback restores the previous active adapter or disables the active adapter cleanly.
+- The audit log explains every automatic decision and every skipped action.
+- Rate limits and cooldowns prevent repeated unnecessary training runs.
+
+### Failure Signals
+
+- Autopilot creates datasets or training runs before readiness thresholds are met.
+- Autopilot trains from uncorrected failures when policy forbids it.
+- Autopilot silently uses dry-run or fallback training during the final real MLX gate.
+- Promotion happens before served validation.
+- Served validation does not prove adapter headers.
+- Failed validation still promotes.
+- Policy-disabled capabilities still take autopilot actions.
+- Audit logs omit why an action happened or why an action was skipped.
+- Rollback cannot restore the previous adapter state.
+- The final adapted chat requires manual pointer edits, manual API calls, or log inspection to prove success.
+
+### Go / No-Go Decision
+
+Phase 4 passes only if FlyChain can run the full policy-driven loop smoothly on the real local stack: failures and corrections trigger dataset creation, real MLX training runs, served validation proves the adapter, promotion follows policy, chat uses the active adapter, failures are explainable, rate limits work, and rollback is reliable. If any hidden manual glue is still required, or if any automatic decision lacks audit evidence, the system is not ready to be considered fully self-driving.
 
 ---
 
