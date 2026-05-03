@@ -23,6 +23,7 @@ from flychain_capability_compiler.schema import (
     CapabilitySpec,
     DatasetSliceRule,
     EvalDimension,
+    EvaluatorConfig,
     PromotionGate,
     TrainingMethod,
 )
@@ -57,7 +58,20 @@ Schema (omit fields only if you truly have no info):
   "name": "<display name>",
   "description": "<1-3 sentences>",
   "eval_dimensions": [
-    { "id": "<snake_case>", "description": "<what the judge checks>", "weight": <0.0-2.0> }
+    {
+      "id": "<snake_case>",
+      "description": "<what the judge checks>",
+      "weight": <0.0-2.0>,
+      "evaluator": {
+        "mode": "llm_judge" | "deterministic" | "hybrid",
+        "deterministic": {
+          "type": "exact_match" | "case_insensitive_exact_match" | "contains" | "regex_match" | "json_valid" | "json_schema" | "numeric_range" | "one_of",
+          "expected": "<value if relevant>",
+          "pattern": "<regex if relevant>",
+          "normalize": { "trim": true }
+        }
+      }
+    }
   ],
   "slice_rules": [
     { "type": "tag" | "regex" | "semantic", "value": "<filter>" }
@@ -69,6 +83,10 @@ Schema (omit fields only if you truly have no info):
 
 Rules:
   - Always produce at least one eval dimension.
+  - Use deterministic evaluators only when the user's rule is objective and clear:
+    exact output, valid JSON/schema, regex, numeric range, contains, or one-of.
+  - Use hybrid when a deterministic format check must pass before an LLM judges semantics.
+  - Use llm_judge or omit evaluator for subjective quality, reasoning, helpfulness, tone, or groundedness.
   - Use `semantic` slice rules only when tag/regex can't express the filter.
   - Default eligible_methods to ["sft", "dpo"] unless the user says otherwise.
   - Keep `id` globally unique and kebab-case.
@@ -139,6 +157,7 @@ def _coerce_spec(data: dict) -> CapabilitySpec:
                 id=str(d["id"]),
                 description=str(d.get("description", "")),
                 judge_prompt_ref=_coerce_optional_str(d.get("judge_prompt_ref")),
+                evaluator=_coerce_evaluator(d.get("evaluator")),
                 weight=_coerce_float(d.get("weight"), default=1.0),
             )
         )
@@ -204,6 +223,19 @@ def _coerce_optional_str(value) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _coerce_evaluator(value) -> EvaluatorConfig | None:
+    if not isinstance(value, dict):
+        return None
+    deterministic = value.get("deterministic")
+    payload = {"mode": value.get("mode", "llm_judge")}
+    if isinstance(deterministic, dict):
+        payload["deterministic"] = deterministic
+    try:
+        return EvaluatorConfig.model_validate(payload)
+    except Exception:
+        return None
 
 
 def _coerce_slug(value: str) -> str:

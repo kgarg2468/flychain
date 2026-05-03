@@ -9,6 +9,7 @@ promotion gating) runs per capability.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,6 +19,50 @@ class TrainingMethod(StrEnum):
     DPO = "dpo"
     KTO = "kto"
     GRPO = "grpo"
+
+
+class EvaluatorMode(StrEnum):
+    LLM_JUDGE = "llm_judge"
+    DETERMINISTIC = "deterministic"
+    HYBRID = "hybrid"
+
+
+class DeterministicEvaluatorType(StrEnum):
+    EXACT_MATCH = "exact_match"
+    CASE_INSENSITIVE_EXACT_MATCH = "case_insensitive_exact_match"
+    CONTAINS = "contains"
+    REGEX_MATCH = "regex_match"
+    JSON_VALID = "json_valid"
+    JSON_SCHEMA = "json_schema"
+    NUMERIC_RANGE = "numeric_range"
+    ONE_OF = "one_of"
+
+
+class NormalizationRules(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    trim: bool = False
+    collapse_whitespace: bool = False
+
+
+class DeterministicEvaluator(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    type: DeterministicEvaluatorType
+    expected: Any | None = None
+    pattern: str | None = None
+    json_schema: dict[str, Any] | None = Field(default=None, alias="schema")
+    min_value: float | None = Field(default=None, alias="min")
+    max_value: float | None = Field(default=None, alias="max")
+    options: list[Any] | None = None
+    normalize: NormalizationRules = Field(default_factory=NormalizationRules)
+
+
+class EvaluatorConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: EvaluatorMode = EvaluatorMode.LLM_JUDGE
+    deterministic: DeterministicEvaluator | None = None
 
 
 class EvalDimension(BaseModel):
@@ -30,6 +75,12 @@ class EvalDimension(BaseModel):
     judge_prompt_ref: str | None = Field(
         default=None,
         description="Path (relative to evals/judge-prompts) of the judge template to use.",
+    )
+    evaluator: EvaluatorConfig | None = Field(
+        default=None,
+        description=(
+            "Optional evaluator configuration. Missing means legacy LLM-as-judge behavior."
+        ),
     )
     weight: float = Field(
         default=1.0,
@@ -94,7 +145,12 @@ class CapabilitySpec(BaseModel):
 __all__ = [
     "CapabilitySpec",
     "DatasetSliceRule",
+    "DeterministicEvaluator",
+    "DeterministicEvaluatorType",
     "EvalDimension",
+    "EvaluatorConfig",
+    "EvaluatorMode",
+    "NormalizationRules",
     "PromotionGate",
     "TrainingMethod",
 ]

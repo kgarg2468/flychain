@@ -6,7 +6,11 @@ import pytest
 from flychain_capability_compiler import (
     CapabilitySpec,
     DatasetSliceRule,
+    DeterministicEvaluator,
+    DeterministicEvaluatorType,
     EvalDimension,
+    EvaluatorConfig,
+    EvaluatorMode,
     PromotionGate,
     TrainingMethod,
 )
@@ -63,3 +67,41 @@ def test_extra_fields_forbidden() -> None:
                 "surprise_field": 1,
             }
         )
+
+
+def test_eval_dimension_supports_deterministic_evaluator_roundtrip() -> None:
+    spec = CapabilitySpec(
+        id="adapter-sentinel",
+        name="Adapter Sentinel",
+        description="Return the exact adapter sentinel token.",
+        eval_dimensions=[
+            EvalDimension(
+                id="exact_sentinel",
+                description="Must return exactly ADAPTER_SENTINEL_OK.",
+                evaluator=EvaluatorConfig(
+                    mode=EvaluatorMode.DETERMINISTIC,
+                    deterministic=DeterministicEvaluator(
+                        type=DeterministicEvaluatorType.EXACT_MATCH,
+                        expected="ADAPTER_SENTINEL_OK",
+                        normalize={"trim": True},
+                    ),
+                ),
+            )
+        ],
+    )
+
+    restored = CapabilitySpec.model_validate(spec.model_dump(mode="json"))
+
+    evaluator = restored.eval_dimensions[0].evaluator
+    assert evaluator is not None
+    assert evaluator.mode == EvaluatorMode.DETERMINISTIC
+    assert evaluator.deterministic is not None
+    assert evaluator.deterministic.type == DeterministicEvaluatorType.EXACT_MATCH
+    assert evaluator.deterministic.expected == "ADAPTER_SENTINEL_OK"
+    assert evaluator.deterministic.normalize.trim is True
+
+
+def test_legacy_eval_dimension_defaults_to_llm_judge() -> None:
+    dimension = EvalDimension(id="quality", description="Judge whether the answer is useful.")
+
+    assert dimension.evaluator is None

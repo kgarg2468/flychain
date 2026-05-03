@@ -118,6 +118,10 @@ class TraceStore:
                     "passed": 1 if r.get("passed") else 0,
                     "reason": r.get("reason", "") or "",
                     "judge_model": r.get("judge_model", "") or "",
+                    "evaluator_type": r.get("evaluator_type", "llm_judge") or "llm_judge",
+                    "evaluator_source": r.get("evaluator_source", "")
+                    or r.get("judge_model", "")
+                    or "",
                     "ts": datetime.now(UTC),
                 }
             )
@@ -173,14 +177,14 @@ class TraceStore:
         rows = self._merge_rows(
             persisted=self._query_rows(
                 "SELECT trace_id, project_id, capability_id, dimension, score, passed, "
-                "reason, judge_model, ts FROM eval_scores"
+                "reason, judge_model, evaluator_type, evaluator_source, ts FROM eval_scores"
             ),
             buffered=self.buffered_eval_scores(),
             key=lambda row: (
                 row["trace_id"],
                 row["capability_id"],
                 row["dimension"],
-                row.get("judge_model", ""),
+                row.get("evaluator_source") or row.get("judge_model", ""),
             ),
         )
         if project_id is not None:
@@ -384,6 +388,8 @@ class TraceStore:
                             r["passed"],
                             r["reason"],
                             r["judge_model"],
+                            r["evaluator_type"],
+                            r["evaluator_source"],
                             r["ts"],
                         ]
                         for r in rows
@@ -397,6 +403,8 @@ class TraceStore:
                         "passed",
                         "reason",
                         "judge_model",
+                        "evaluator_type",
+                        "evaluator_source",
                         "ts",
                     ],
                 )
@@ -480,4 +488,8 @@ def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
         normalized["ts"] = ts.astimezone(UTC).isoformat()
     if "passed" in normalized:
         normalized["passed"] = bool(normalized["passed"])
+    if "evaluator_type" not in normalized:
+        normalized["evaluator_type"] = "llm_judge"
+    if "evaluator_source" not in normalized:
+        normalized["evaluator_source"] = normalized.get("judge_model", "")
     return normalized

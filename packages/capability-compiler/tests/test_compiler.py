@@ -10,6 +10,7 @@ from flychain_capability_compiler import (
     parse_json_strict,
 )
 from flychain_capability_compiler.compiler import _coerce_spec
+from flychain_capability_compiler.schema import EvaluatorMode
 
 
 class FakeLLM:
@@ -88,6 +89,46 @@ async def test_compile_tolerates_fenced_json() -> None:
     assert spec.id == "x"
     # Default eval dimension gets added.
     assert spec.eval_dimensions and spec.eval_dimensions[0].id == "meets_user_intent"
+
+
+@pytest.mark.asyncio
+async def test_compile_preserves_deterministic_evaluator_config() -> None:
+    fake = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "id": "adapter-sentinel",
+                    "name": "Adapter Sentinel",
+                    "description": "Return the exact adapter sentinel token.",
+                    "eval_dimensions": [
+                        {
+                            "id": "exact_sentinel",
+                            "description": "Must return exactly ADAPTER_SENTINEL_OK.",
+                            "evaluator": {
+                                "mode": "deterministic",
+                                "deterministic": {
+                                    "type": "exact_match",
+                                    "expected": "ADAPTER_SENTINEL_OK",
+                                    "normalize": {"trim": True},
+                                },
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    compiler = CapabilityCompiler(llm=fake)
+
+    spec = await compiler.compile(
+        "When asked for the FlyChain adapter sentinel token, return exactly ADAPTER_SENTINEL_OK."
+    )
+
+    evaluator = spec.eval_dimensions[0].evaluator
+    assert evaluator is not None
+    assert evaluator.mode == EvaluatorMode.DETERMINISTIC
+    assert evaluator.deterministic is not None
+    assert evaluator.deterministic.expected == "ADAPTER_SENTINEL_OK"
 
 
 def test_coerce_spec_slugifies_id() -> None:

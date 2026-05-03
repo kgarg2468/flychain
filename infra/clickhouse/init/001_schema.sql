@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS flychain.eval_scores (
     passed          UInt8,
     reason          String CODEC(ZSTD(3)),
     judge_model     LowCardinality(String),
+    evaluator_type  LowCardinality(String),
+    evaluator_source LowCardinality(String),
     ts              DateTime64(3, 'UTC')
 )
 ENGINE = MergeTree

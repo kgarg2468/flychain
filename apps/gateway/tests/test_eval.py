@@ -112,6 +112,89 @@ def test_eval_returns_scores_for_matching_capability(client: TestClient) -> None
     rows = client.get("/debug/eval-scores").json()
     assert len(rows) == 3
     assert all(r["capability_id"] == "groundedness" for r in rows)
+    assert all(r["evaluator_type"] == "llm_judge" for r in rows)
+    assert all(r["evaluator_source"] == "fake:fake" for r in rows)
+
+
+def test_eval_persists_deterministic_evaluator_proof(client: TestClient) -> None:
+    resp = client.post(
+        "/v1/capabilities",
+        json={
+            "id": "adapter-sentinel",
+            "name": "Adapter Sentinel",
+            "description": "Return the exact adapter sentinel token.",
+            "eval_dimensions": [
+                {
+                    "id": "exact_sentinel",
+                    "description": "Must return exactly ADAPTER_SENTINEL_OK.",
+                    "evaluator": {
+                        "mode": "deterministic",
+                        "deterministic": {
+                            "type": "exact_match",
+                            "expected": "ADAPTER_SENTINEL_OK",
+                            "normalize": {"trim": True},
+                        },
+                    },
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    eval_resp = client.post(
+        "/v1/eval",
+        json={
+            "trace_id": "trace_fake_token",
+            "project_id": "p1",
+            "input": "What is the FlyChain adapter sentinel token?",
+            "output": "0xADAPTER_SENTINEL_OK",
+            "capability_ids": ["adapter-sentinel"],
+        },
+    )
+
+    assert eval_resp.status_code == 200, eval_resp.text
+    score = eval_resp.json()["per_capability"]["adapter-sentinel"]["scores"][0]
+    assert score["passed"] is False
+    assert score["evaluator_type"] == "deterministic"
+    assert score["evaluator_source"] == "deterministic:exact_match"
+
+    rows = client.get("/debug/eval-scores").json()
+    assert rows[0]["evaluator_type"] == "deterministic"
+    assert rows[0]["evaluator_source"] == "deterministic:exact_match"
+
+
+def test_eval_uses_explicit_judge_provider_setting(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded: dict[str, Any] = {}
+
+    def _factory(*_args: Any, **kwargs: Any) -> FakeLLM:
+        recorded.update(kwargs)
+        return FakeLLM([0.9, 0.9, 0.9])
+
+    monkeypatch.setattr(gw_main, "auto_client", _factory)
+    _mk_groundedness(client)
+    settings_resp = client.put(
+        "/v1/settings",
+        json={"judge_provider": "local-ollama", "judge_model": "llama3.2:3b"},
+    )
+    assert settings_resp.status_code == 200, settings_resp.text
+
+    resp = client.post(
+        "/v1/eval",
+        json={
+            "trace_id": "trace_explicit_judge",
+            "project_id": "p1",
+            "input": "What does page 12 say?",
+            "output": "Page 12 says onboarding is self-serve.",
+            "context": "Page 12: Users onboard via self-serve signup.",
+            "tags": {"task": "rag"},
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert recorded["prefer"] == "local-ollama"
+    assert recorded["ollama_model"] == "llama3.2:3b"
 
 
 def test_eval_skips_capabilities_that_dont_match_slice(client: TestClient) -> None:

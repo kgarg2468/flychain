@@ -39,6 +39,7 @@ from flychain_capability_compiler.eval import (
     TraceData,
     aggregate_score,
     default_judge_prompts_dir,
+    evaluate_deterministic,
     parse_judge_output,
     render_judge_prompt,
 )
@@ -69,7 +70,12 @@ from flychain_capability_compiler.recipe import (
 from flychain_capability_compiler.schema import (
     CapabilitySpec,
     DatasetSliceRule,
+    DeterministicEvaluator,
+    DeterministicEvaluatorType,
     EvalDimension,
+    EvaluatorConfig,
+    EvaluatorMode,
+    NormalizationRules,
     PromotionGate,
     TrainingMethod,
 )
@@ -97,7 +103,12 @@ __all__ = [
     # schema
     "CapabilitySpec",
     "DatasetSliceRule",
+    "DeterministicEvaluator",
+    "DeterministicEvaluatorType",
     "EvalDimension",
+    "EvaluatorConfig",
+    "EvaluatorMode",
+    "NormalizationRules",
     "PromotionGate",
     "TrainingMethod",
     # compiler
@@ -149,6 +160,7 @@ __all__ = [
     "TraceData",
     "aggregate_score",
     "default_judge_prompts_dir",
+    "evaluate_deterministic",
     "parse_judge_output",
     "render_judge_prompt",
     # templates

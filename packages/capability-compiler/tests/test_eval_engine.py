@@ -8,8 +8,12 @@ import pytest
 from flychain_capability_compiler import (
     CapabilitySpec,
     DatasetSliceRule,
+    DeterministicEvaluator,
+    DeterministicEvaluatorType,
     EvalDimension,
     EvalEngine,
+    EvaluatorConfig,
+    EvaluatorMode,
     PromotionGate,
     SliceMatcher,
     TraceData,
@@ -216,6 +220,181 @@ async def test_engine_handles_bad_judge_output() -> None:
     assert scores[0].score == 0.0
     assert scores[0].passed is False
     assert "judge parse error" in scores[0].reason
+
+
+@pytest.mark.asyncio
+async def test_exact_match_evaluator_passes_only_exact_trimmed_output() -> None:
+    spec = CapabilitySpec(
+        id="adapter-sentinel",
+        name="Adapter Sentinel",
+        description="Return the sentinel token.",
+        eval_dimensions=[
+            EvalDimension(
+                id="exact_sentinel",
+                description="Must return exactly ADAPTER_SENTINEL_OK.",
+                evaluator=EvaluatorConfig(
+                    mode=EvaluatorMode.DETERMINISTIC,
+                    deterministic=DeterministicEvaluator(
+                        type=DeterministicEvaluatorType.EXACT_MATCH,
+                        expected="ADAPTER_SENTINEL_OK",
+                        normalize={"trim": True},
+                    ),
+                ),
+            )
+        ],
+    )
+    fake = FakeLLM(["should-not-be-consumed"])
+    engine = EvalEngine(llm=fake)
+
+    passing = await engine.evaluate_trace(
+        TraceData(trace_id="t-pass", project_id="p", input="q", output=" ADAPTER_SENTINEL_OK\n"),
+        spec,
+    )
+    fake_token = await engine.evaluate_trace(
+        TraceData(trace_id="t-fail", project_id="p", input="q", output="0xADAPTER_SENTINEL_OK"),
+        spec,
+    )
+
+    assert passing[0].passed is True
+    assert passing[0].score == 1.0
+    assert passing[0].evaluator_type == "deterministic"
+    assert passing[0].evaluator_source == "deterministic:exact_match"
+    assert fake_token[0].passed is False
+    assert fake_token[0].score == 0.0
+    assert "expected exact match" in fake_token[0].reason
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_trim_normalization_only_applies_when_configured() -> None:
+    spec = CapabilitySpec(
+        id="adapter-sentinel",
+        name="Adapter Sentinel",
+        description="Return the sentinel token.",
+        eval_dimensions=[
+            EvalDimension(
+                id="exact_sentinel",
+                description="Must return exactly ADAPTER_SENTINEL_OK.",
+                evaluator=EvaluatorConfig(
+                    mode=EvaluatorMode.DETERMINISTIC,
+                    deterministic=DeterministicEvaluator(
+                        type=DeterministicEvaluatorType.EXACT_MATCH,
+                        expected="ADAPTER_SENTINEL_OK",
+                    ),
+                ),
+            )
+        ],
+    )
+    engine = EvalEngine(llm=FakeLLM(["should-not-be-consumed"]))
+
+    scores = await engine.evaluate_trace(
+        TraceData(trace_id="t", project_id="p", input="q", output="ADAPTER_SENTINEL_OK\n"),
+        spec,
+    )
+
+    assert scores[0].passed is False
+
+
+@pytest.mark.asyncio
+async def test_invalid_regex_fails_cleanly_without_llm_call() -> None:
+    spec = CapabilitySpec(
+        id="regex-cap",
+        name="Regex Cap",
+        description="Output must match regex.",
+        eval_dimensions=[
+            EvalDimension(
+                id="regex",
+                description="Must match configured regex.",
+                evaluator=EvaluatorConfig(
+                    mode=EvaluatorMode.DETERMINISTIC,
+                    deterministic=DeterministicEvaluator(
+                        type=DeterministicEvaluatorType.REGEX_MATCH,
+                        pattern="[",
+                    ),
+                ),
+            )
+        ],
+    )
+    fake = FakeLLM(["should-not-be-consumed"])
+    engine = EvalEngine(llm=fake)
+
+    scores = await engine.evaluate_trace(
+        TraceData(trace_id="t", project_id="p", input="q", output="anything"),
+        spec,
+    )
+
+    assert scores[0].passed is False
+    assert scores[0].score == 0.0
+    assert "invalid regex" in scores[0].reason
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_hybrid_evaluator_skips_llm_when_deterministic_check_fails() -> None:
+    spec = CapabilitySpec(
+        id="json-quality",
+        name="JSON Quality",
+        description="Output must be JSON and useful.",
+        eval_dimensions=[
+            EvalDimension(
+                id="valid_json_and_quality",
+                description="Must be valid JSON and semantically useful.",
+                evaluator=EvaluatorConfig(
+                    mode=EvaluatorMode.HYBRID,
+                    deterministic=DeterministicEvaluator(
+                        type=DeterministicEvaluatorType.JSON_VALID,
+                    ),
+                ),
+            )
+        ],
+    )
+    fake = FakeLLM([json.dumps({"score": 1.0, "passed": True, "reason": "great"})])
+    engine = EvalEngine(llm=fake)
+
+    scores = await engine.evaluate_trace(
+        TraceData(trace_id="t", project_id="p", input="q", output="{not json"),
+        spec,
+    )
+
+    assert scores[0].passed is False
+    assert scores[0].evaluator_type == "hybrid"
+    assert scores[0].evaluator_source == "deterministic:json_valid"
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_hybrid_evaluator_calls_llm_after_deterministic_pass() -> None:
+    spec = CapabilitySpec(
+        id="json-quality",
+        name="JSON Quality",
+        description="Output must be JSON and useful.",
+        eval_dimensions=[
+            EvalDimension(
+                id="valid_json_and_quality",
+                description="Must be valid JSON and semantically useful.",
+                evaluator=EvaluatorConfig(
+                    mode=EvaluatorMode.HYBRID,
+                    deterministic=DeterministicEvaluator(
+                        type=DeterministicEvaluatorType.JSON_VALID,
+                    ),
+                ),
+            )
+        ],
+    )
+    fake = FakeLLM([json.dumps({"score": 0.82, "passed": True, "reason": "useful"})])
+    engine = EvalEngine(llm=fake)
+
+    scores = await engine.evaluate_trace(
+        TraceData(trace_id="t", project_id="p", input="q", output='{"ok": true}'),
+        spec,
+    )
+
+    assert scores[0].passed is True
+    assert scores[0].score == 0.82
+    assert scores[0].reason == "useful"
+    assert scores[0].evaluator_type == "hybrid"
+    assert scores[0].evaluator_source == "fake:fake"
+    assert len(fake.calls) == 1
 
 
 def test_aggregate_score_weighted_mean() -> None:
