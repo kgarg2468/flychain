@@ -109,11 +109,25 @@ def test_activate_run_moves_pointer(client: TestClient, monkeypatch: pytest.Monk
         recipe_id="sft-mlx-lora",
         dataset_id="ds_demo",
         dataset_path=str(Path(client.app.state.training_run_store.directory) / "demo.jsonl"),
-        status="trained",
+        status="validated",
         created_at="2026-04-22T00:00:00+00:00",
         updated_at="2026-04-22T00:00:00+00:00",
         artifact={
-            "adapter_dir": str(Path(client.app.state.training_run_store.directory) / "adapter")
+            "backend": "mlx-lm",
+            "adapter_dir": str(Path(client.app.state.training_run_store.directory) / "adapter"),
+            "base_model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+            "dry_run": False,
+        },
+        served_validation={
+            "status": "passed",
+            "aggregate_score": 1.0,
+            "validation_trace_ids": ["trace_validated"],
+            "provider": "local-mlx",
+            "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+            "adapter_run_id": "run_trained",
+            "adapter_capability_id": "groundedness",
+            "routing_mode": "candidate",
+            "failures": [],
         },
     )
     client.app.state.training_run_store.save(run)
@@ -258,17 +272,17 @@ def test_apply_gate_uses_latest_comparison_when_candidate_omitted(client: TestCl
     gate = client.post(f"/v1/training-runs/{run.id}/apply-gate", json={})
     assert gate.status_code == 202, gate.text
     assert gate.json()["status"] == "gate-queued"
-    assert queue.calls == [
-        {
-            "function": "apply_promotion_gate",
-            "args": (),
-            "kwargs": {
-                "run_id": run.id,
-                "candidate": {"groundedness": 0.82},
-                "baseline": {"groundedness": 0.4},
-            },
-        }
-    ]
+    assert len(queue.calls) == 1
+    call = queue.calls[0]
+    assert call["function"] == "apply_promotion_gate"
+    assert call["args"] == ()
+    assert call["kwargs"]["job_id"].startswith("job_")
+    assert call["kwargs"] == {
+        "run_id": run.id,
+        "candidate": {"groundedness": 0.82},
+        "baseline": {"groundedness": 0.4},
+        "job_id": call["kwargs"]["job_id"],
+    }
 
 
 def pytest_approx(expected: float, tol: float = 1e-6):

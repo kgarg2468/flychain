@@ -310,21 +310,20 @@ def test_chat_completions_enqueues_auto_eval_when_enabled(client: TestClient) ->
     assert resp.status_code == 200, resp.text
     trace_id = resp.headers["x-flychain-trace-id"]
 
-    assert queue.calls == [
-        {
-            "function": "evaluate_trace",
-            "args": (),
-            "kwargs": {
-                "trace_id": trace_id,
-                "project_id": "unit-test",
-                "input_text": "What does the policy say?",
-                "output_text": "hello from mock",
-                "context": "",
-                "tags": {"task": "rag"},
-                "capability_ids": ["groundedness"],
-            },
-        }
-    ]
+    assert len(queue.calls) == 1
+    call = queue.calls[0]
+    assert call["function"] == "evaluate_trace"
+    assert call["args"] == ()
+    assert call["kwargs"].pop("job_id").startswith("job_")
+    assert call["kwargs"] == {
+        "trace_id": trace_id,
+        "project_id": "unit-test",
+        "input_text": "What does the policy say?",
+        "output_text": "hello from mock",
+        "context": "",
+        "tags": {"task": "rag"},
+        "capability_ids": ["groundedness"],
+    }
 
 
 def test_messages_enqueues_auto_eval_when_enabled(client: TestClient) -> None:
@@ -348,21 +347,20 @@ def test_messages_enqueues_auto_eval_when_enabled(client: TestClient) -> None:
     assert resp.status_code == 200, resp.text
     trace_id = resp.headers["x-flychain-trace-id"]
 
-    assert queue.calls == [
-        {
-            "function": "evaluate_trace",
-            "args": (),
-            "kwargs": {
-                "trace_id": trace_id,
-                "project_id": "anthropic-test",
-                "input_text": "Summarize the doc",
-                "output_text": "hi",
-                "context": "",
-                "tags": {"task": "rag"},
-                "capability_ids": ["groundedness"],
-            },
-        }
-    ]
+    assert len(queue.calls) == 1
+    call = queue.calls[0]
+    assert call["function"] == "evaluate_trace"
+    assert call["args"] == ()
+    assert call["kwargs"].pop("job_id").startswith("job_")
+    assert call["kwargs"] == {
+        "trace_id": trace_id,
+        "project_id": "anthropic-test",
+        "input_text": "Summarize the doc",
+        "output_text": "hi",
+        "context": "",
+        "tags": {"task": "rag"},
+        "capability_ids": ["groundedness"],
+    }
 
 
 def test_feedback_endpoint(client: TestClient) -> None:

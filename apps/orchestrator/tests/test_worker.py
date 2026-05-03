@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 import httpx
 import pytest
 from flychain_gateway.capability_store import default_data_dir
+from flychain_gateway.job_store import JobStore
 from flychain_gateway.training_store import AdapterPointerStore, TrainingRun, TrainingRunStore
 from flychain_orchestrator import eval_client
 from flychain_orchestrator.worker import (
@@ -16,6 +18,7 @@ from flychain_orchestrator.worker import (
     apply_promotion_gate,
     evaluate_trace,
     noop,
+    run_served_validation,
     run_training_recipe,
 )
 
@@ -31,6 +34,7 @@ def test_worker_settings_has_functions() -> None:
     assert evaluate_trace in WorkerSettings.functions
     assert run_training_recipe in WorkerSettings.functions
     assert apply_promotion_gate in WorkerSettings.functions
+    assert run_served_validation in WorkerSettings.functions
 
 
 @pytest.mark.asyncio
@@ -66,6 +70,37 @@ async def test_evaluate_trace_calls_gateway(monkeypatch: pytest.MonkeyPatch) -> 
     )
     assert result["evaluated_capabilities"] == ["groundedness"]
     assert "/v1/eval" in recorded["url"]
+
+
+@pytest.mark.asyncio
+async def test_evaluate_trace_records_timeout_job(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("FLYCHAIN_DATA_DIR", str(tmp_path / "flychain-data"))
+    data_dir = default_data_dir()
+    job_store = JobStore(data_dir / "jobs")
+    job = job_store.create(job_type="auto_eval", timeout_seconds=0)
+
+    async def _slow_eval(**_: Any) -> dict[str, Any]:
+        await asyncio.sleep(0)
+        return {"trace_id": "t-timeout"}
+
+    monkeypatch.setattr("flychain_orchestrator.worker.post_eval", _slow_eval)
+
+    with pytest.raises(TimeoutError):
+        await evaluate_trace(
+            {"settings": None},
+            job_id=job.id,
+            trace_id="t-timeout",
+            project_id="p1",
+            input_text="q",
+            output_text="a",
+        )
+
+    saved = job_store.load(job.id)
+    assert saved is not None
+    assert saved.status == "timed_out"
+    assert "timed out" in str(saved.error)
 
 
 @pytest.mark.asyncio
@@ -156,5 +191,135 @@ async def test_apply_promotion_gate_updates_run_and_pointer(
     assert saved.status == "promoted"
 
     active = AdapterPointerStore(data_dir / "pointers").get("groundedness")
+    assert active is None
+
+
+@pytest.mark.asyncio
+async def test_apply_promotion_gate_blocks_real_adapter_without_served_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("FLYCHAIN_DATA_DIR", str(tmp_path / "flychain-data"))
+    data_dir = default_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    run = TrainingRun(
+        id="run_real_unvalidated",
+        capability_id="groundedness",
+        recipe_id="sft-mlx-lora",
+        dataset_id="ds_demo",
+        dataset_path=str(data_dir / "datasets" / "groundedness" / "demo.jsonl"),
+        status="trained",
+        created_at="2026-04-22T00:00:00+00:00",
+        updated_at="2026-04-22T00:00:00+00:00",
+        artifact={
+            "backend": "mlx-lm",
+            "adapter_dir": str(data_dir / "runs" / "run_real_unvalidated" / "artifacts"),
+            "base_model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+            "dry_run": False,
+        },
+        baseline={"groundedness": 0.6},
+        candidate={},
+    )
+    TrainingRunStore(data_dir / "runs").save(run)
+
+    result = await apply_promotion_gate(
+        {},
+        run_id=run.id,
+        candidate={"groundedness": 0.72},
+        baseline=None,
+    )
+
+    assert result["status"] == "archived"
+    assert result["gate_verdict"]["decision"] == "archive"
+    assert "served validation" in result["gate_verdict"]["reason"]
+    assert AdapterPointerStore(data_dir / "pointers").get("groundedness") is None
+
+
+@pytest.mark.asyncio
+async def test_apply_promotion_gate_promotes_validated_real_adapter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("FLYCHAIN_DATA_DIR", str(tmp_path / "flychain-data"))
+    data_dir = default_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    run = TrainingRun(
+        id="run_real_validated",
+        capability_id="groundedness",
+        recipe_id="sft-mlx-lora",
+        dataset_id="ds_demo",
+        dataset_path=str(data_dir / "datasets" / "groundedness" / "demo.jsonl"),
+        status="validated",
+        created_at="2026-04-22T00:00:00+00:00",
+        updated_at="2026-04-22T00:00:00+00:00",
+        artifact={
+            "backend": "mlx-lm",
+            "adapter_dir": str(data_dir / "runs" / "run_real_validated" / "artifacts"),
+            "base_model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+            "dry_run": False,
+        },
+        baseline={"groundedness": 0.6},
+        candidate={},
+        served_validation={
+            "status": "passed",
+            "aggregate_score": 1.0,
+            "validation_trace_ids": ["trace_validated"],
+            "provider": "local-mlx",
+            "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+            "adapter_run_id": "run_real_validated",
+            "adapter_capability_id": "groundedness",
+            "routing_mode": "candidate",
+            "failures": [],
+        },
+    )
+    TrainingRunStore(data_dir / "runs").save(run)
+
+    result = await apply_promotion_gate(
+        {},
+        run_id=run.id,
+        candidate={"groundedness": 0.72},
+        baseline=None,
+    )
+
+    assert result["status"] == "promoted"
+    active = AdapterPointerStore(data_dir / "pointers").get("groundedness")
     assert active is not None
     assert active["active_run_id"] == run.id
+
+
+@pytest.mark.asyncio
+async def test_apply_promotion_gate_blocks_forged_served_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("FLYCHAIN_DATA_DIR", str(tmp_path / "flychain-data"))
+    data_dir = default_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    run = TrainingRun(
+        id="run_real_forged",
+        capability_id="groundedness",
+        recipe_id="sft-mlx-lora",
+        dataset_id="ds_demo",
+        dataset_path=str(data_dir / "datasets" / "groundedness" / "demo.jsonl"),
+        status="validated",
+        created_at="2026-04-22T00:00:00+00:00",
+        updated_at="2026-04-22T00:00:00+00:00",
+        artifact={
+            "backend": "mlx-lm",
+            "adapter_dir": str(data_dir / "runs" / "run_real_forged" / "artifacts"),
+            "base_model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+            "dry_run": False,
+        },
+        baseline={"groundedness": 0.6},
+        candidate={},
+        served_validation={"status": "passed", "aggregate_score": 1.0},
+    )
+    TrainingRunStore(data_dir / "runs").save(run)
+
+    result = await apply_promotion_gate(
+        {},
+        run_id=run.id,
+        candidate={"groundedness": 0.72},
+        baseline=None,
+    )
+
+    assert result["status"] == "archived"
+    assert "served validation" in result["gate_verdict"]["reason"]
+    assert AdapterPointerStore(data_dir / "pointers").get("groundedness") is None

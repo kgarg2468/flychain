@@ -133,13 +133,12 @@ def test_training_run_is_queued_and_enqueued(client: TestClient) -> None:
     body = resp.json()
     assert body["status"] == "queued"
     assert body["artifact"] is None
-    assert queue.calls == [
-        {
-            "function": "run_training_recipe",
-            "args": (),
-            "kwargs": {"run_id": body["id"]},
-        }
-    ]
+    assert len(queue.calls) == 1
+    call = queue.calls[0]
+    assert call["function"] == "run_training_recipe"
+    assert call["args"] == ()
+    assert call["kwargs"]["run_id"] == body["id"]
+    assert call["kwargs"]["job_id"].startswith("job_")
     saved = client.get(f"/v1/training-runs/{body['id']}")
     assert saved.status_code == 200
     assert saved.json()["status"] == "queued"
@@ -192,17 +191,17 @@ def test_apply_gate_is_queued(client: TestClient) -> None:
     body = gate_resp.json()
     assert body["status"] == "gate-queued"
     assert body["candidate"] == {"groundedness": 0.72}
-    assert queue.calls == [
-        {
-            "function": "apply_promotion_gate",
-            "args": (),
-            "kwargs": {
-                "baseline": None,
-                "candidate": {"groundedness": 0.72},
-                "run_id": run.id,
-            },
-        }
-    ]
+    assert len(queue.calls) == 1
+    call = queue.calls[0]
+    assert call["function"] == "apply_promotion_gate"
+    assert call["args"] == ()
+    assert call["kwargs"]["job_id"].startswith("job_")
+    assert call["kwargs"] == {
+        "baseline": None,
+        "candidate": {"groundedness": 0.72},
+        "run_id": run.id,
+        "job_id": call["kwargs"]["job_id"],
+    }
     active = client.get("/v1/capabilities/groundedness/active-adapter").json()
     assert active["active"] is None
 
