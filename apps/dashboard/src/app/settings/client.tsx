@@ -35,6 +35,17 @@ export function SettingsClient({ initial }: { initial: SettingsPayload }) {
           Local Runtime Knobs
         </div>
         <div className="mt-5 grid gap-4">
+          <Field label="Judge provider">
+            <select
+              value={form.judge_provider}
+              onChange={(e) => update('judge_provider', e.target.value)}
+              className="w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm outline-none"
+            >
+              <option value="local-ollama">local-ollama</option>
+              <option value="openai">openai</option>
+              <option value="anthropic">anthropic</option>
+            </select>
+          </Field>
           <Field label="Judge model">
             <input
               value={form.judge_model}

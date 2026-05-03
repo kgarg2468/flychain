@@ -74,12 +74,31 @@ vi.mock('@/lib/gateway', async () => {
       }),
       datasets: vi.fn().mockResolvedValue({ datasets: [] }),
       trainingRuns: vi.fn().mockResolvedValue({ runs: [] }),
+      jobs: vi.fn().mockResolvedValue({
+        jobs: [
+          {
+            id: 'job_1',
+            type: 'served_validation',
+            status: 'failed',
+            created_at: '2026-04-22T00:00:00+00:00',
+            updated_at: '2026-04-22T00:00:01+00:00',
+            capability_id: 'groundedness',
+            run_id: 'run_1',
+            retry_count: 0,
+            max_retries: 1,
+            trace_ids: [],
+            error: 'served validation failed',
+          },
+        ],
+      }),
+      retryJob: vi.fn(),
       failures: vi.fn().mockResolvedValue({ capability_id: 'groundedness', failures: [] }),
       replaySets: vi.fn().mockResolvedValue({ replay_sets: [] }),
       recipes: vi.fn().mockResolvedValue({ recipes: [] }),
       getSettings: vi.fn().mockResolvedValue({
         settings: {
           judge_model: 'llama3.2:3b',
+          judge_provider: 'local-ollama',
           embedding_model: 'nomic-embed-text',
           min_cluster_size: 3,
           auto_eval_new_traces: false,
@@ -120,6 +139,15 @@ describe('HomePage', () => {
 
     expect(screen.getByRole('heading', { name: /chat/i })).toBeInTheDocument();
     expect(screen.getByLabelText(/message/i)).toBeInTheDocument();
+  });
+
+  it('renders the Jobs tab with recent job status', async () => {
+    render(await HomePage({ searchParams: { tab: 'jobs' } }));
+
+    expect(screen.getByRole('heading', { name: /jobs/i })).toBeInTheDocument();
+    expect(screen.getByText('job_1')).toBeInTheDocument();
+    expect(screen.getByText('served_validation')).toBeInTheDocument();
+    expect(screen.getByText('served validation failed')).toBeInTheDocument();
   });
 
   it('renders active adapter details in selected capability detail', async () => {

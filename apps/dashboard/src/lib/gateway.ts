@@ -153,8 +153,51 @@ export interface TrainingRunRow {
     delta: number;
     ts: string;
   } | null;
+  served_validation: {
+    status: string;
+    replay_set_id?: string;
+    job_id?: string | null;
+    aggregate_score?: number;
+    sample_count?: number;
+    validation_trace_ids?: string[];
+    provider?: string;
+    model?: string;
+    adapter_run_id?: string;
+    adapter_capability_id?: string;
+    failures?: Array<Record<string, unknown>>;
+    started_at?: string;
+    finished_at?: string;
+  } | null;
   allow_backend_fallback: boolean;
   error: string | null;
+}
+
+export interface JobRow {
+  id: string;
+  type: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  capability_id?: string | null;
+  trace_ids: string[];
+  cluster_id?: string | null;
+  dataset_id?: string | null;
+  run_id?: string | null;
+  replay_set_id?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  duration_ms?: number | null;
+  retry_count: number;
+  max_retries: number;
+  timeout_seconds?: number | null;
+  next_retry_at?: string | null;
+  worker_id?: string | null;
+  error?: string | null;
+  retry_payload?: Record<string, unknown> | null;
+}
+
+export interface JobsResponse {
+  jobs: JobRow[];
 }
 
 export interface ActiveAdapter {
@@ -178,6 +221,7 @@ export interface RecipeRow {
 }
 
 export interface RuntimeSettings {
+  judge_provider: string;
   judge_model: string;
   embedding_model: string;
   min_cluster_size: number;
@@ -529,6 +573,14 @@ export const gateway = {
     return request(`/v1/training-runs/${encodeURIComponent(runId)}/apply-gate`, {
       method: 'POST',
       body: JSON.stringify(args),
+    });
+  },
+  async jobs(limit = 100): Promise<JobsResponse> {
+    return request<JobsResponse>(`/v1/jobs?limit=${encodeURIComponent(String(limit))}`);
+  },
+  async retryJob(jobId: string): Promise<JobRow> {
+    return request<JobRow>(`/v1/jobs/${encodeURIComponent(jobId)}/retry`, {
+      method: 'POST',
     });
   },
   async activeAdapter(id: string): Promise<ActiveAdapter> {

@@ -1,16 +1,20 @@
 'use client';
 
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { useState, useTransition } from 'react';
 
 import { ChatClient } from './chat/client';
 import { CapabilityControls } from './capabilities/[id]/controls';
 import { SettingsClient } from './settings/client';
+import { gateway } from '@/lib/gateway';
 import type {
   ActiveAdapter,
   CapabilitySpec,
   ClustersResponse,
   DatasetEntry,
   FailureRow,
+  JobRow,
   RecipeRow,
   ReplaySetRecord,
   Scorecard,
@@ -19,7 +23,7 @@ import type {
   TrainingRunRow,
 } from '@/lib/gateway';
 
-type WorkspaceTab = 'capabilities' | 'chat' | 'traces' | 'settings';
+type WorkspaceTab = 'capabilities' | 'chat' | 'traces' | 'jobs' | 'settings';
 
 export interface CapabilitySnapshot {
   capability: CapabilitySpec;
@@ -45,6 +49,7 @@ interface WorkspaceClientProps {
   selectedCapability: SelectedCapabilityDetail | null;
   capabilities: CapabilitySpec[];
   traces: TraceListResponse;
+  jobs: JobRow[];
   settings: SettingsPayload;
   loadError: string | null;
   filters: {
@@ -59,6 +64,7 @@ const tabs: Array<{ id: WorkspaceTab; label: string }> = [
   { id: 'capabilities', label: 'Capabilities' },
   { id: 'chat', label: 'Chat' },
   { id: 'traces', label: 'Traces' },
+  { id: 'jobs', label: 'Jobs' },
   { id: 'settings', label: 'Settings' },
 ];
 
@@ -68,6 +74,7 @@ export function WorkspaceClient({
   selectedCapability,
   capabilities,
   traces,
+  jobs,
   settings,
   loadError,
   filters,
@@ -128,6 +135,7 @@ export function WorkspaceClient({
           {activeTab === 'traces' ? (
             <TracesPanel traces={traces} capabilities={capabilities} filters={filters} />
           ) : null}
+          {activeTab === 'jobs' ? <JobsPanel jobs={jobs} /> : null}
           {activeTab === 'settings' ? <SettingsClient initial={settings} /> : null}
         </section>
       </div>
@@ -339,6 +347,14 @@ function CapabilityDetail({ selected }: { selected: SelectedCapabilityDetail | n
                 <div className="mt-1 text-xs text-neutral-500">
                   {run.recipe_id} / {run.dataset_id}
                 </div>
+                {run.served_validation ? (
+                  <div className="mt-1 text-xs text-neutral-500">
+                    validation {run.served_validation.status}
+                    {typeof run.served_validation.aggregate_score === 'number'
+                      ? ` / ${run.served_validation.aggregate_score.toFixed(2)}`
+                      : ''}
+                  </div>
+                ) : null}
               </div>
             ))
           )}
@@ -371,6 +387,140 @@ function SummarySection({ title, children }: { title: string; children: React.Re
 
 function EmptyInline({ children }: { children: React.ReactNode }) {
   return <div className="py-3 text-sm text-neutral-500">{children}</div>;
+}
+
+function JobsPanel({ jobs }: { jobs: JobRow[] }) {
+  const router = useRouter();
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [pendingJobId, setPendingJobId] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+
+  const activeCount = jobs.filter((job) =>
+    ['queued', 'running', 'retrying'].includes(job.status),
+  ).length;
+  const failedCount = jobs.filter((job) => ['failed', 'timed_out'].includes(job.status)).length;
+
+  function retry(job: JobRow) {
+    setMessage(null);
+    setError(null);
+    setPendingJobId(job.id);
+    startTransition(async () => {
+      try {
+        const retried = await gateway.retryJob(job.id);
+        setMessage(`${retried.id} queued for retry.`);
+        router.refresh();
+      } catch (e) {
+        setError((e as Error).message);
+      } finally {
+        setPendingJobId(null);
+      }
+    });
+  }
+
+  return (
+    <div className="flex flex-col gap-5">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+        <div>
+          <div className="text-xs font-semibold uppercase tracking-[0.18em] text-neutral-400">
+            Jobs
+          </div>
+          <h2 className="mt-1 text-xl font-semibold tracking-tight">Jobs</h2>
+        </div>
+        <dl className="grid grid-cols-3 gap-4 text-sm">
+          <Metric label="Recent" value={String(jobs.length)} />
+          <Metric label="Active" value={String(activeCount)} />
+          <Metric label="Failed" value={String(failedCount)} />
+        </dl>
+      </div>
+
+      {message ? (
+        <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
+          {message}
+        </div>
+      ) : null}
+      {error ? (
+        <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          {error}
+        </div>
+      ) : null}
+
+      <section className="overflow-hidden rounded-xl border border-neutral-200 bg-white">
+        {jobs.length === 0 ? (
+          <div className="p-8 text-sm text-neutral-500">No background jobs recorded yet.</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-neutral-200 text-left text-sm">
+              <thead className="bg-neutral-50 text-xs uppercase tracking-[0.14em] text-neutral-500">
+                <tr>
+                  <th className="px-4 py-3">Job</th>
+                  <th className="px-4 py-3">Status</th>
+                  <th className="px-4 py-3">Target</th>
+                  <th className="px-4 py-3">Runtime</th>
+                  <th className="px-4 py-3">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-neutral-100">
+                {jobs.map((job) => {
+                  const retryable =
+                    ['failed', 'timed_out'].includes(job.status) &&
+                    job.retry_count < job.max_retries;
+                  return (
+                    <tr key={job.id} className="align-top">
+                      <td className="px-4 py-4">
+                        <div className="font-mono text-xs text-neutral-700">{job.id}</div>
+                        <div className="mt-1 text-xs text-neutral-500">{job.type}</div>
+                        {job.error ? (
+                          <div className="mt-2 max-w-md text-xs text-red-600">{job.error}</div>
+                        ) : null}
+                      </td>
+                      <td className="px-4 py-4">
+                        <span className={`rounded-full px-2 py-1 text-xs font-medium ${jobStatusClass(job.status)}`}>
+                          {job.status}
+                        </span>
+                      </td>
+                      <td className="px-4 py-4 text-xs text-neutral-600">
+                        <div>{job.capability_id ?? '-'}</div>
+                        {job.run_id ? <div className="mt-1 font-mono">{job.run_id}</div> : null}
+                        {job.replay_set_id ? (
+                          <div className="mt-1 font-mono">{job.replay_set_id}</div>
+                        ) : null}
+                      </td>
+                      <td className="px-4 py-4 text-xs text-neutral-600">
+                        <div>{job.duration_ms === null || job.duration_ms === undefined ? '-' : `${job.duration_ms}ms`}</div>
+                        <div className="mt-1">
+                          retries {job.retry_count}/{job.max_retries}
+                        </div>
+                      </td>
+                      <td className="px-4 py-4">
+                        <button
+                          type="button"
+                          disabled={!retryable || isPending}
+                          onClick={() => retry(job)}
+                          className="rounded-lg border border-neutral-200 px-3 py-2 text-xs font-medium text-neutral-700 transition hover:border-neutral-400 hover:text-neutral-950 disabled:opacity-50"
+                        >
+                          {pendingJobId === job.id ? 'Retrying...' : 'Retry'}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function jobStatusClass(status: string): string {
+  if (status === 'succeeded') return 'bg-emerald-50 text-emerald-700';
+  if (status === 'failed' || status === 'timed_out') return 'bg-red-50 text-red-700';
+  if (status === 'running' || status === 'queued' || status === 'retrying') {
+    return 'bg-amber-50 text-amber-700';
+  }
+  return 'bg-neutral-100 text-neutral-700';
 }
 
 function TracesPanel({

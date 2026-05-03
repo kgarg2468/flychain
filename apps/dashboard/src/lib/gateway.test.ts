@@ -109,3 +109,73 @@ describe('gateway.updateSettings', () => {
     });
   });
 });
+
+describe('gateway job APIs', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('lists jobs through the same-origin gateway proxy', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          jobs: [
+            {
+              id: 'job_1',
+              type: 'served_validation',
+              status: 'failed',
+              created_at: '2026-04-22T00:00:00+00:00',
+              updated_at: '2026-04-22T00:00:01+00:00',
+              retry_count: 0,
+              max_retries: 1,
+              trace_ids: [],
+              error: 'validation failed',
+            },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await gateway.jobs();
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/gateway/v1/jobs?limit=100', {
+      cache: 'no-store',
+      headers: {
+        'content-type': 'application/json',
+      },
+    });
+    expect(result.jobs[0]?.id).toBe('job_1');
+  });
+
+  it('retries a job through the gateway proxy', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: 'job_1',
+          type: 'auto_eval',
+          status: 'queued',
+          created_at: '2026-04-22T00:00:00+00:00',
+          updated_at: '2026-04-22T00:00:02+00:00',
+          retry_count: 1,
+          max_retries: 2,
+          trace_ids: [],
+        }),
+        { status: 202, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await gateway.retryJob('job_1');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/gateway/v1/jobs/job_1/retry', {
+      cache: 'no-store',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+    });
+    expect(result.status).toBe('queued');
+  });
+});

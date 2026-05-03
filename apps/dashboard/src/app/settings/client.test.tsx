@@ -13,6 +13,7 @@ vi.mock('@/lib/gateway', async () => {
       ...actual.gateway,
       updateSettings: vi.fn().mockResolvedValue({
         settings: {
+          judge_provider: 'local-ollama',
           judge_model: 'llama3.2:3b',
           embedding_model: 'nomic-embed-text',
           min_cluster_size: 3,
@@ -33,6 +34,7 @@ describe('SettingsClient', () => {
       <SettingsClient
         initial={{
           settings: {
+            judge_provider: 'local-ollama',
             judge_model: 'llama3.2:1b',
             embedding_model: 'nomic-embed-text',
             min_cluster_size: 2,
@@ -58,6 +60,7 @@ describe('SettingsClient', () => {
     await user.click(screen.getByRole('button', { name: /apply settings/i }));
 
     expect(gateway.updateSettings).toHaveBeenCalledWith({
+      judge_provider: 'local-ollama',
       judge_model: 'llama3.2:3b',
       embedding_model: 'nomic-embed-text',
       min_cluster_size: 2,

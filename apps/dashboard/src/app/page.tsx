@@ -6,11 +6,12 @@ import {
 import {
   gateway,
   type CapabilitySpec,
+  type JobRow,
   type SettingsPayload,
   type TraceListResponse,
 } from '@/lib/gateway';
 
-type WorkspaceTab = 'capabilities' | 'chat' | 'traces' | 'settings';
+type WorkspaceTab = 'capabilities' | 'chat' | 'traces' | 'jobs' | 'settings';
 
 interface PageProps {
   searchParams?: Record<string, string | string[] | undefined>;
@@ -18,6 +19,7 @@ interface PageProps {
 
 const fallbackSettings: SettingsPayload = {
   settings: {
+    judge_provider: 'local-ollama',
     judge_model: 'llama3.2:3b',
     embedding_model: 'nomic-embed-text',
     min_cluster_size: 3,
@@ -33,7 +35,9 @@ function first(value: string | string[] | undefined): string | undefined {
 }
 
 function normalizeTab(value: string | undefined): WorkspaceTab {
-  if (value === 'chat' || value === 'traces' || value === 'settings') return value;
+  if (value === 'chat' || value === 'traces' || value === 'jobs' || value === 'settings') {
+    return value;
+  }
   return 'capabilities';
 }
 
@@ -124,6 +128,10 @@ export default async function HomePage({ searchParams }: PageProps = {}) {
       .catch((): TraceListResponse => ({ traces: [], total: 0, limit: 100, offset: 0 })),
     loadSelectedCapability(selectedCapabilityId),
   ]);
+  const jobs: JobRow[] = await gateway
+    .jobs()
+    .then((result) => result.jobs)
+    .catch(() => []);
 
   return (
     <WorkspaceClient
@@ -132,6 +140,7 @@ export default async function HomePage({ searchParams }: PageProps = {}) {
       selectedCapability={selectedCapability}
       capabilities={capabilities}
       traces={traces}
+      jobs={jobs}
       settings={settings}
       loadError={loadError}
       filters={filters}

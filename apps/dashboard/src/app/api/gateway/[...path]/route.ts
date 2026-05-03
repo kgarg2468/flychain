@@ -6,9 +6,13 @@ const FORWARDED_HEADERS = [
   'x-flychain-project',
   'x-flychain-capabilities',
   'x-flychain-tags',
+  'x-flychain-candidate-run-id',
 ];
 const RESPONSE_HEADERS = [
   'x-flychain-trace-id',
+  'x-flychain-adapter-run-id',
+  'x-flychain-adapter-capability-id',
+  'x-flychain-adapter-routing-mode',
   'x-flychain-active-adapter-run-id',
   'x-flychain-active-adapter-capability-id',
   'x-flychain-provider',
