@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -10,6 +11,7 @@ from dataclasses import asdict
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from flychain_capability_compiler import (
     CapabilityCompiler,
@@ -45,6 +47,7 @@ from flychain_gateway.capability_store import (
 )
 from flychain_gateway.cluster_store import ClusterStore, DatasetStore
 from flychain_gateway.config import Settings, get_settings
+from flychain_gateway.job_store import JobRecord, JobStore
 from flychain_gateway.models_registry import ModelNotFoundError, ModelRegistry, get_registry
 from flychain_gateway.otel import get_tracer, make_llm_attributes, setup_tracing
 from flychain_gateway.providers.registry import ProviderRouter
@@ -52,10 +55,12 @@ from flychain_gateway.replay_store import ReplaySet, ReplaySetStore
 from flychain_gateway.schemas import (
     AnthropicMessagesRequest,
     ChatCompletionRequest,
+    ChatMessage,
     FeedbackAccepted,
     FeedbackRequest,
     TraceRecord,
 )
+from flychain_gateway.served_validation import served_validation_errors
 from flychain_gateway.settings_store import LocalSettings, SettingsStore
 from flychain_gateway.trace_store import TraceStore
 from flychain_gateway.training_store import (
@@ -125,9 +130,9 @@ def _flatten_content(content: Any) -> str:
                 continue
             if not isinstance(item, dict):
                 continue
-            text = item.get("text")
-            if isinstance(text, str) and text.strip():
-                parts.append(text.strip())
+            text_value = item.get("text")
+            if isinstance(text_value, str) and text_value.strip():
+                parts.append(text_value.strip())
                 continue
             content_value = item.get("content")
             if isinstance(content_value, str) and content_value.strip():
@@ -212,6 +217,7 @@ async def lifespan(app: FastAPI):
     adapter_pointer_store = AdapterPointerStore(data_root / "pointers")
     replay_set_store = ReplaySetStore(data_root / "replay-sets")
     local_settings_store = SettingsStore(data_root / "settings.json")
+    job_store = JobStore(data_root / "jobs")
     job_queue: ArqRedis | None = None
     if create_pool is not None:
         try:
@@ -230,6 +236,7 @@ async def lifespan(app: FastAPI):
     app.state.adapter_pointer_store = adapter_pointer_store
     app.state.replay_set_store = replay_set_store
     app.state.local_settings_store = local_settings_store
+    app.state.job_store = job_store
     app.state.job_queue = job_queue
 
     try:
@@ -256,6 +263,13 @@ def create_app() -> FastAPI:
         store: SettingsStore = app.state.local_settings_store
         return store.load()
 
+    def judge_client(runtime: LocalSettings | None = None):
+        settings = runtime or local_settings()
+        return auto_client(
+            prefer=settings.judge_provider,
+            ollama_model=settings.judge_model,
+        )
+
     def require_job_queue() -> ArqRedis:
         queue: ArqRedis | None = getattr(app.state, "job_queue", None)
         if queue is None:
@@ -264,6 +278,38 @@ def create_app() -> FastAPI:
                 detail="background job queue is unavailable; check Redis/orchestrator",
             )
         return queue
+
+    def create_job(
+        *,
+        job_type: str,
+        capability_id: str | None = None,
+        trace_ids: list[str] | None = None,
+        cluster_id: str | None = None,
+        dataset_id: str | None = None,
+        run_id: str | None = None,
+        replay_set_id: str | None = None,
+        max_retries: int = 0,
+        timeout_seconds: int | None = None,
+        retry_payload: dict[str, Any] | None = None,
+    ) -> JobRecord:
+        job_store: JobStore = app.state.job_store
+        return job_store.create(
+            job_type=job_type,
+            capability_id=capability_id,
+            trace_ids=trace_ids,
+            cluster_id=cluster_id,
+            dataset_id=dataset_id,
+            run_id=run_id,
+            replay_set_id=replay_set_id,
+            max_retries=max_retries,
+            timeout_seconds=timeout_seconds,
+            retry_payload=retry_payload,
+        )
+
+    async def wait_for_job_timeout(job: JobRecord, awaitable):
+        if job.timeout_seconds is None:
+            return await awaitable
+        return await asyncio.wait_for(awaitable, timeout=job.timeout_seconds)
 
     async def maybe_enqueue_auto_eval(
         *,
@@ -285,8 +331,27 @@ def create_app() -> FastAPI:
             return
         if not output_text.strip():
             return
+        job = create_job(
+            job_type="auto_eval",
+            capability_id=capability_ids[0] if len(capability_ids) == 1 else None,
+            trace_ids=[trace_id],
+            max_retries=2,
+            retry_payload={
+                "function": "evaluate_trace",
+                "kwargs": {
+                    "trace_id": trace_id,
+                    "project_id": project_id,
+                    "input_text": input_text,
+                    "output_text": output_text,
+                    "context": "",
+                    "tags": tags,
+                    "capability_ids": capability_ids or None,
+                },
+            },
+        )
         await queue.enqueue_job(
             "evaluate_trace",
+            job_id=job.id,
             trace_id=trace_id,
             project_id=project_id,
             input_text=input_text,
@@ -412,6 +477,21 @@ def create_app() -> FastAPI:
             tags=dict(row.get("tags") or {}),
         )
 
+    def run_requires_served_validation(run: TrainingRun) -> bool:
+        artifact = run.artifact or {}
+        return artifact.get("backend") == "mlx-lm" and not bool(artifact.get("dry_run"))
+
+    def run_has_served_validation(run: TrainingRun) -> bool:
+        if not run_requires_served_validation(run):
+            return True
+        return not served_validation_errors(run)
+
+    def served_validation_error_detail(run: TrainingRun) -> str:
+        errors = served_validation_errors(run)
+        if not errors:
+            return ""
+        return "served validation proof is incomplete: " + "; ".join(errors)
+
     async def maybe_auto_cluster_failures(
         *, specs: list[CapabilitySpec], failed_capability_ids: set[str]
     ) -> dict[str, Any]:
@@ -431,7 +511,7 @@ def create_app() -> FastAPI:
                 capability=spec,
                 failures=failures,
                 embedder=auto_embedder(ollama_model=runtime.embedding_model),
-                llm=auto_client(ollama_model=runtime.judge_model),
+                llm=judge_client(runtime),
                 min_cluster_size=runtime.min_cluster_size,
                 summarize=True,
             )
@@ -477,6 +557,135 @@ def create_app() -> FastAPI:
             }
         return None
 
+    def resolve_run_mlx_adapter(run: TrainingRun) -> dict[str, str]:
+        settings: Settings = app.state.settings
+        artifact = run.artifact or {}
+        if artifact.get("backend") != "mlx-lm" or bool(artifact.get("dry_run")):
+            raise HTTPException(status_code=409, detail="run has no real MLX adapter artifact")
+        adapter_dir = str(artifact.get("adapter_dir") or "")
+        base_model = str(artifact.get("base_model") or "")
+        if not adapter_dir or not base_model:
+            raise HTTPException(status_code=409, detail="run artifact is missing adapter metadata")
+        if not settings.mlx_server_url:
+            raise HTTPException(
+                status_code=503,
+                detail="FLYCHAIN_MLX_SERVER_URL is required to serve candidate MLX adapters",
+            )
+        return {
+            "capability_id": run.capability_id,
+            "run_id": run.id,
+            "adapter_dir": adapter_dir,
+            "base_model": base_model,
+        }
+
+    def resolve_candidate_mlx_adapter(
+        candidate_run_id: str, capability_ids: list[str]
+    ) -> dict[str, str]:
+        run_store: TrainingRunStore = app.state.training_run_store
+        run = run_store.load(candidate_run_id)
+        if run is None:
+            raise HTTPException(
+                status_code=404, detail=f"no such candidate run: {candidate_run_id}"
+            )
+        if run.capability_id not in capability_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "candidate validation requires x-flychain-capabilities to include "
+                    f"{run.capability_id}"
+                ),
+            )
+        return resolve_run_mlx_adapter(run)
+
+    async def serve_run_adapter_chat(
+        *,
+        run: TrainingRun,
+        body: ChatCompletionRequest,
+        project_id: str,
+        tags: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        router: ProviderRouter = app.state.router
+        store: TraceStore = app.state.trace_store
+        registry: ModelRegistry = app.state.registry
+        adapter = resolve_run_mlx_adapter(run)
+        try:
+            resolved = router.resolve_mlx_chat(adapter["base_model"])
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        payload = body.model_dump(exclude_none=True)
+        payload["model"] = resolved.model_id
+        payload["adapters"] = adapter["adapter_dir"]
+
+        trace_id = _new_id("trace")
+        t0 = time.perf_counter()
+        status = "ok"
+        error = ""
+        try:
+            result = await resolved.adapter.chat_completions(
+                model=resolved.model_id,
+                body=payload,
+                api_key=resolved.api_key,
+            )
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            await store.insert_trace(
+                TraceRecord(
+                    trace_id=trace_id,
+                    project_id=project_id,
+                    provider=resolved.provider_name,
+                    model=resolved.model_id,
+                    method="candidate-run.chat.completions",
+                    request=payload,
+                    response=None,
+                    capability_ids=[run.capability_id],
+                    latency_ms=latency_ms,
+                    status="error",
+                    error=str(exc),
+                    tags=tags or {},
+                )
+            )
+            raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
+
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        if result.error:
+            status = "error"
+            error = result.error
+
+        cost_usd = registry.cost_usd(
+            resolved.model_id, result.prompt_tokens, result.completion_tokens
+        )
+        await store.insert_trace(
+            TraceRecord(
+                trace_id=trace_id,
+                project_id=project_id,
+                provider=resolved.provider_name,
+                model=resolved.model_id,
+                method="candidate-run.chat.completions",
+                request=payload,
+                response=result.payload,
+                capability_ids=[run.capability_id],
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                total_tokens=result.total_tokens,
+                cost_usd=cost_usd,
+                latency_ms=latency_ms,
+                status=status,
+                error=error,
+                tags=tags or {},
+            )
+        )
+        return {
+            "payload": dict(result.payload),
+            "trace_id": trace_id,
+            "provider": resolved.provider_name,
+            "model": resolved.model_id,
+            "adapter_run_id": run.id,
+            "adapter_capability_id": run.capability_id,
+            "output_text": _chat_output_text(result.payload),
+            "raw_status": result.raw_status,
+        }
+
     def resolve_cluster(capability_id: str, cluster_id: str) -> Cluster:
         cluster_store: ClusterStore = app.state.cluster_store
         stored = cluster_store.load(capability_id)
@@ -518,6 +727,9 @@ def create_app() -> FastAPI:
         x_flychain_project: str | None = Header(default=None, alias="x-flychain-project"),
         x_flychain_capabilities: str | None = Header(default=None, alias="x-flychain-capabilities"),
         x_flychain_tags: str | None = Header(default=None, alias="x-flychain-tags"),
+        x_flychain_candidate_run_id: str | None = Header(
+            default=None, alias="x-flychain-candidate-run-id"
+        ),
     ) -> Response:
         if body.stream:
             # Phase 1 returns a clear error for streaming; streaming lands later.
@@ -538,12 +750,22 @@ def create_app() -> FastAPI:
             default_project_id=settings.default_project_id,
         )
 
-        active_adapter = resolve_active_mlx_adapter(capability_ids)
+        adapter_proof: dict[str, str] | None = None
         try:
-            if active_adapter is not None:
-                resolved = router.resolve_mlx_chat(active_adapter["base_model"])
+            if x_flychain_candidate_run_id:
+                adapter_proof = resolve_candidate_mlx_adapter(
+                    x_flychain_candidate_run_id, capability_ids
+                )
+                adapter_proof["routing_mode"] = "candidate"
+                resolved = router.resolve_mlx_chat(adapter_proof["base_model"])
             else:
-                resolved = router.resolve_chat(body.model)
+                active_adapter = resolve_active_mlx_adapter(capability_ids)
+                if active_adapter is not None:
+                    adapter_proof = dict(active_adapter)
+                    adapter_proof["routing_mode"] = "active"
+                    resolved = router.resolve_mlx_chat(adapter_proof["base_model"])
+                else:
+                    resolved = router.resolve_chat(body.model)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except (ModelNotFoundError, ValueError) as exc:
@@ -551,8 +773,8 @@ def create_app() -> FastAPI:
 
         payload = body.model_dump(exclude_none=True)
         payload["model"] = resolved.model_id
-        if active_adapter is not None:
-            payload["adapters"] = active_adapter["adapter_dir"]
+        if adapter_proof is not None:
+            payload["adapters"] = adapter_proof["adapter_dir"]
 
         trace_id = _new_id("trace")
         tracer = get_tracer()
@@ -651,17 +873,62 @@ def create_app() -> FastAPI:
             "x-flychain-provider": resolved.provider_name,
             "x-flychain-model": resolved.model_id,
         }
-        if active_adapter is not None:
+        if adapter_proof is not None:
             extra_headers.update(
                 {
-                    "x-flychain-active-adapter-run-id": active_adapter["run_id"],
-                    "x-flychain-active-adapter-capability-id": active_adapter["capability_id"],
+                    "x-flychain-adapter-run-id": adapter_proof["run_id"],
+                    "x-flychain-adapter-capability-id": adapter_proof["capability_id"],
+                    "x-flychain-adapter-routing-mode": adapter_proof["routing_mode"],
+                }
+            )
+        if adapter_proof is not None and adapter_proof.get("routing_mode") == "active":
+            extra_headers.update(
+                {
+                    "x-flychain-active-adapter-run-id": adapter_proof["run_id"],
+                    "x-flychain-active-adapter-capability-id": adapter_proof["capability_id"],
                 }
             )
         return _json_response(
             response_body,
             status_code=result.raw_status if result.raw_status < 400 else 502,
             extra_headers=extra_headers,
+        )
+
+    @app.post("/internal/training-runs/{run_id}/chat/completions")
+    async def internal_run_chat_completions(
+        run_id: str,
+        body: ChatCompletionRequest,
+        x_flychain_project: str | None = Header(default=None, alias="x-flychain-project"),
+        x_flychain_tags: str | None = Header(default=None, alias="x-flychain-tags"),
+    ) -> Response:
+        run_store: TrainingRunStore = app.state.training_run_store
+        run = run_store.load(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"no such training run: {run_id}")
+        if body.stream:
+            raise HTTPException(status_code=400, detail="streaming is not supported here")
+        project_id, _capability_ids, tags = _extract_headers(
+            x_flychain_project=x_flychain_project,
+            x_flychain_capabilities=None,
+            x_flychain_tags=x_flychain_tags,
+            default_project_id=app.state.settings.default_project_id,
+        )
+        served = await serve_run_adapter_chat(
+            run=run,
+            body=body,
+            project_id=project_id,
+            tags=tags,
+        )
+        return _json_response(
+            served["payload"],
+            status_code=served["raw_status"] if served["raw_status"] < 400 else 502,
+            extra_headers={
+                "x-flychain-trace-id": served["trace_id"],
+                "x-flychain-provider": served["provider"],
+                "x-flychain-model": served["model"],
+                "x-flychain-active-adapter-run-id": served["adapter_run_id"],
+                "x-flychain-active-adapter-capability-id": served["adapter_capability_id"],
+            },
         )
 
     @app.post("/v1/messages")
@@ -888,7 +1155,7 @@ def create_app() -> FastAPI:
         dashboard can stream it from a single origin.
         """
         runtime = local_settings()
-        compiler = CapabilityCompiler(llm=auto_client(ollama_model=runtime.judge_model))
+        compiler = CapabilityCompiler(llm=judge_client(runtime))
         questions = await compiler.propose_questions(body.description)
         return {
             "questions": [{"id": q.id, "question": q.question} for q in questions],
@@ -904,7 +1171,7 @@ def create_app() -> FastAPI:
         POSTs to /v1/capabilities if they want to save it.
         """
         runtime = local_settings()
-        compiler = CapabilityCompiler(llm=auto_client(ollama_model=runtime.judge_model))
+        compiler = CapabilityCompiler(llm=judge_client(runtime))
         spec = await compiler.compile(body.description, body.answers or {})
         return {
             "spec": spec.model_dump(mode="json"),
@@ -938,7 +1205,7 @@ def create_app() -> FastAPI:
             specs = capability_store.list()
 
         runtime = local_settings()
-        engine = EvalEngine(llm=auto_client(ollama_model=runtime.judge_model))
+        engine = EvalEngine(llm=judge_client(runtime))
         trace = TraceData(
             trace_id=body.trace_id,
             project_id=body.project_id or "default",
@@ -1010,6 +1277,46 @@ def create_app() -> FastAPI:
             offset=offset,
         )
         return {"traces": traces, "total": total, "limit": limit, "offset": offset}
+
+    @app.get("/v1/jobs")
+    def jobs_list(limit: int = 100) -> dict[str, Any]:
+        job_store: JobStore = app.state.job_store
+        return {"jobs": [job.as_dict() for job in job_store.list(limit=limit)]}
+
+    @app.get("/v1/jobs/{job_id}")
+    def jobs_get(job_id: str) -> dict[str, Any]:
+        job_store: JobStore = app.state.job_store
+        job = job_store.load(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"no such job: {job_id}")
+        return job.as_dict()
+
+    @app.post("/v1/jobs/{job_id}/retry", status_code=202)
+    async def jobs_retry(job_id: str) -> dict[str, Any]:
+        job_store: JobStore = app.state.job_store
+        job = job_store.load(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"no such job: {job_id}")
+        if job.status not in {"failed", "timed_out"}:
+            raise HTTPException(status_code=409, detail=f"job is not retryable: {job.status}")
+        if job.retry_count >= job.max_retries:
+            raise HTTPException(status_code=409, detail="job has no retries remaining")
+        if not job.retry_payload:
+            raise HTTPException(status_code=409, detail="job has no retry payload")
+        function = str(job.retry_payload.get("function") or "")
+        kwargs = dict(job.retry_payload.get("kwargs") or {})
+        if not function:
+            raise HTTPException(status_code=409, detail="job retry payload missing function")
+        kwargs["job_id"] = job.id
+        queue = require_job_queue()
+        retried = job_store.queue_retry(job.id)
+        assert retried is not None
+        try:
+            await queue.enqueue_job(function, **kwargs)
+        except Exception as exc:
+            job_store.fail(job.id, error=f"queue enqueue failed: {exc}")
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return retried.as_dict()
 
     @app.get("/v1/settings")
     def settings_get() -> dict[str, Any]:
@@ -1085,17 +1392,37 @@ def create_app() -> FastAPI:
         else:
             raise HTTPException(status_code=400, detail="provide failures or failure_ids")
 
-        runtime = local_settings()
-        result = await cluster_failures(
-            capability=spec,
-            failures=failures,
-            embedder=auto_embedder(ollama_model=runtime.embedding_model),
-            llm=auto_client(ollama_model=runtime.judge_model) if body.summarize else None,
-            min_cluster_size=body.min_cluster_size,
-            summarize=body.summarize,
+        job = create_job(
+            job_type="cluster",
+            capability_id=capability_id,
+            trace_ids=[failure.trace_id for failure in failures],
+            max_retries=1,
         )
-        cluster_store.save(result)
-        return result.as_dict()
+        started_job = app.state.job_store.start(job.id) or job
+        runtime = local_settings()
+        try:
+            result = await wait_for_job_timeout(
+                started_job,
+                cluster_failures(
+                    capability=spec,
+                    failures=failures,
+                    embedder=auto_embedder(ollama_model=runtime.embedding_model),
+                    llm=judge_client(runtime) if body.summarize else None,
+                    min_cluster_size=body.min_cluster_size,
+                    summarize=body.summarize,
+                ),
+            )
+            cluster_store.save(result)
+            app.state.job_store.succeed(job.id)
+            return result.as_dict()
+        except TimeoutError as exc:
+            app.state.job_store.timeout(
+                job.id, error=f"cluster job timed out after {started_job.timeout_seconds}s"
+            )
+            raise HTTPException(status_code=504, detail="cluster job timed out") from exc
+        except Exception as exc:
+            app.state.job_store.fail(job.id, error=str(exc))
+            raise
 
     @app.get("/v1/capabilities/{capability_id}/clusters")
     def capabilities_clusters(capability_id: str) -> dict[str, Any]:
@@ -1152,53 +1479,77 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="provide cluster or cluster_id")
 
         method = body.method.lower()
-        if method == "sft":
-            runtime = local_settings()
-            rows = await synthesize_sft_dataset(
-                capability=spec,
-                cluster=cluster,
-                failures=failures,
-                llm=auto_client(ollama_model=runtime.judge_model)
-                if body.generate_missing
-                else None,
-                generate_missing=body.generate_missing,
-            )
-        elif method == "dpo":
-            runtime = local_settings()
-            rows = await synthesize_dpo_dataset(
-                capability=spec,
-                cluster=cluster,
-                failures=failures,
-                llm=auto_client(ollama_model=runtime.judge_model)
-                if body.generate_missing
-                else None,
-                generate_missing=body.generate_missing,
-            )
-        else:
+        if method not in {"sft", "dpo"}:
             raise HTTPException(status_code=400, detail="method must be sft or dpo")
 
-        dataset_id = f"ds_{ULID()}"
-        out_dir = default_data_dir() / "datasets" / capability_id
-        out_path = out_dir / f"{dataset_id}.jsonl"
-        write_jsonl(out_path, rows)
-
-        record = SynthesizedDataset(
-            id=dataset_id,
+        job = create_job(
+            job_type="dataset_synthesis",
             capability_id=capability_id,
+            trace_ids=list(cluster.trace_ids),
             cluster_id=cluster.id,
-            method=method,
-            path=str(out_path),
-            row_count=len(rows),
+            max_retries=1,
         )
-        dataset_store.record(record)
-        return {
-            "id": record.id,
-            "capability_id": record.capability_id,
-            "cluster_id": record.cluster_id,
-            "method": record.method,
-            "path": record.path,
-            "row_count": record.row_count,
-        }
+        started_job = app.state.job_store.start(job.id) or job
+        try:
+            runtime = local_settings()
+            if method == "sft":
+                rows_awaitable = synthesize_sft_dataset(
+                    capability=spec,
+                    cluster=cluster,
+                    failures=failures,
+                    llm=judge_client(runtime)
+                    if body.generate_missing
+                    else None,
+                    generate_missing=body.generate_missing,
+                )
+            else:
+                rows_awaitable = synthesize_dpo_dataset(
+                    capability=spec,
+                    cluster=cluster,
+                    failures=failures,
+                    llm=judge_client(runtime)
+                    if body.generate_missing
+                    else None,
+                    generate_missing=body.generate_missing,
+                )
+            rows = await wait_for_job_timeout(started_job, rows_awaitable)
+
+            dataset_id = f"ds_{ULID()}"
+            out_dir = default_data_dir() / "datasets" / capability_id
+            out_path = out_dir / f"{dataset_id}.jsonl"
+            write_jsonl(out_path, rows)
+
+            record = SynthesizedDataset(
+                id=dataset_id,
+                capability_id=capability_id,
+                cluster_id=cluster.id,
+                method=method,
+                path=str(out_path),
+                row_count=len(rows),
+            )
+            dataset_store.record(record)
+            started_job.dataset_id = record.id
+            app.state.job_store.save(started_job)
+            app.state.job_store.succeed(job.id)
+            return {
+                "id": record.id,
+                "capability_id": record.capability_id,
+                "cluster_id": record.cluster_id,
+                "method": record.method,
+                "path": record.path,
+                "row_count": record.row_count,
+            }
+        except TimeoutError as exc:
+            app.state.job_store.timeout(
+                job.id,
+                error=f"dataset synthesis job timed out after {started_job.timeout_seconds}s",
+            )
+            raise HTTPException(
+                status_code=504, detail="dataset synthesis job timed out"
+            ) from exc
+        except Exception as exc:
+            app.state.job_store.fail(job.id, error=str(exc))
+            raise
 
     @app.get("/v1/capabilities/{capability_id}/datasets")
     def capabilities_datasets(capability_id: str) -> dict[str, Any]:
@@ -1256,9 +1607,24 @@ def create_app() -> FastAPI:
         )
         run_store.save(run)
 
+        job = create_job(
+            job_type="training",
+            capability_id=run.capability_id,
+            dataset_id=run.dataset_id,
+            run_id=run.id,
+            max_retries=0,
+            retry_payload={"function": "run_training_recipe", "kwargs": {"run_id": run.id}},
+        )
+        job.retry_payload = {
+            "function": "run_training_recipe",
+            "kwargs": {"run_id": run.id, "job_id": job.id},
+        }
+        app.state.job_store.save(job)
+
         try:
-            await queue.enqueue_job("run_training_recipe", run_id=run.id)
+            await queue.enqueue_job("run_training_recipe", run_id=run.id, job_id=job.id)
         except Exception as exc:
+            app.state.job_store.fail(job.id, error=f"queue enqueue failed: {exc}")
             run.status = "failed"
             run.error = f"queue enqueue failed: {exc}"
             run.updated_at = _now_iso()
@@ -1289,7 +1655,7 @@ def create_app() -> FastAPI:
         run = run_store.load(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail=f"no such training run: {run_id}")
-        if run.status not in {"trained", "archived", "promoted"}:
+        if run.status not in {"trained", "validated", "archived", "promoted"}:
             raise HTTPException(
                 status_code=409, detail=f"run not in a gate-eligible state: {run.status}"
             )
@@ -1318,6 +1684,30 @@ def create_app() -> FastAPI:
         run.status = "gate-queued"
         run.updated_at = _now_iso()
         run_store.save(run)
+        job = create_job(
+            job_type="promotion_gate",
+            capability_id=run.capability_id,
+            run_id=run.id,
+            max_retries=1,
+            retry_payload={
+                "function": "apply_promotion_gate",
+                "kwargs": {
+                    "run_id": run.id,
+                    "candidate": candidate,
+                    "baseline": baseline,
+                },
+            },
+        )
+        job.retry_payload = {
+            "function": "apply_promotion_gate",
+            "kwargs": {
+                "run_id": run.id,
+                "candidate": candidate,
+                "baseline": baseline,
+                "job_id": job.id,
+            },
+        }
+        app.state.job_store.save(job)
 
         try:
             await queue.enqueue_job(
@@ -1325,8 +1715,10 @@ def create_app() -> FastAPI:
                 run_id=run.id,
                 candidate=candidate,
                 baseline=baseline,
+                job_id=job.id,
             )
         except Exception as exc:
+            app.state.job_store.fail(job.id, error=f"queue enqueue failed: {exc}")
             run.status = previous_status
             run.baseline = previous_baseline
             run.candidate = previous_candidate
@@ -1381,6 +1773,258 @@ def create_app() -> FastAPI:
         replay_store.save(record)
         return asdict(record)
 
+    async def run_served_validation_now(
+        *,
+        run_id: str,
+        replay_set_id: str,
+        job_id: str | None = None,
+    ) -> dict[str, Any]:
+        run_store: TrainingRunStore = app.state.training_run_store
+        replay_store: ReplaySetStore = app.state.replay_set_store
+        capability_store: CapabilityStore = app.state.capability_store
+        trace_store: TraceStore = app.state.trace_store
+        job_store: JobStore = app.state.job_store
+
+        run = run_store.load(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"no such training run: {run_id}")
+        replay_set = replay_store.load(replay_set_id)
+        if replay_set is None or replay_set.capability_id != run.capability_id:
+            raise HTTPException(status_code=404, detail=f"no such replay set: {replay_set_id}")
+        try:
+            spec = capability_store.get(run.capability_id)
+        except CapabilityNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"no such capability: {exc}") from exc
+
+        if job_id:
+            job_store.start(job_id)
+
+        started_at = _now_iso()
+        run.status = "validation-running"
+        run.error = None
+        run.served_validation = {
+            "status": "running",
+            "replay_set_id": replay_set_id,
+            "job_id": job_id,
+            "started_at": started_at,
+        }
+        run.updated_at = started_at
+        run_store.save(run)
+
+        validation_trace_ids: list[str] = []
+        all_scores = []
+        failures: list[dict[str, Any]] = []
+        provider = ""
+        model = ""
+        outputs: list[str] = []
+        adapter_run_id = ""
+        adapter_capability_id = ""
+        routing_mode = ""
+
+        try:
+            runtime = local_settings()
+            engine = EvalEngine(llm=judge_client(runtime))
+            transport = httpx.ASGITransport(app=app)
+            for row_dict in replay_set.rows:
+                row = ReplayRow.model_validate(row_dict)
+                messages: list[ChatMessage] = []
+                if row.context:
+                    messages.append(ChatMessage(role="system", content=row.context))
+                messages.append(ChatMessage(role="user", content=row.input))
+                request_body = ChatCompletionRequest(
+                    model=str((run.artifact or {}).get("base_model") or ""),
+                    messages=messages,
+                    stream=False,
+                ).model_dump(exclude_none=True)
+                headers = {
+                    "x-flychain-project": row.project_id or app.state.settings.default_project_id,
+                    "x-flychain-capabilities": run.capability_id,
+                    "x-flychain-candidate-run-id": run.id,
+                }
+                if row.tags:
+                    headers["x-flychain-tags"] = ",".join(
+                        f"{k}={v}" for k, v in row.tags.items()
+                    )
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://flychain-internal"
+                ) as client:
+                    response = await client.post(
+                        "/v1/chat/completions",
+                        json=request_body,
+                        headers=headers,
+                    )
+                response.raise_for_status()
+                served_payload = response.json()
+                provider = response.headers.get("x-flychain-provider", "")
+                model = response.headers.get("x-flychain-model", "")
+                trace_id = response.headers.get("x-flychain-trace-id", "")
+                adapter_run_id = response.headers.get("x-flychain-adapter-run-id", "")
+                adapter_capability_id = response.headers.get(
+                    "x-flychain-adapter-capability-id", ""
+                )
+                routing_mode = response.headers.get("x-flychain-adapter-routing-mode", "")
+                output_text = _chat_output_text(served_payload)
+                if trace_id:
+                    validation_trace_ids.append(trace_id)
+                outputs.append(output_text)
+
+                proof_errors = []
+                if not trace_id:
+                    proof_errors.append("missing trace id")
+                if provider != "local-mlx":
+                    proof_errors.append(f"wrong provider {provider or '<missing>'}")
+                if adapter_run_id != run.id:
+                    proof_errors.append("wrong adapter run id")
+                if adapter_capability_id != run.capability_id:
+                    proof_errors.append("wrong adapter capability id")
+                if routing_mode != "candidate":
+                    proof_errors.append("wrong adapter routing mode")
+
+                trace = TraceData(
+                    trace_id=trace_id or f"{run.id}:missing-trace",
+                    project_id=row.project_id or app.state.settings.default_project_id,
+                    input=row.input,
+                    output=output_text,
+                    context=row.context or "",
+                    tags=dict(row.tags or {}),
+                )
+                scores = await engine.evaluate_trace(trace, spec)
+                all_scores.extend(scores)
+                if proof_errors or any(not score.passed for score in scores):
+                    failures.append(
+                        {
+                            "trace_id": trace.trace_id,
+                            "replay_trace_id": row.trace_id,
+                            "proof_errors": proof_errors,
+                            "scores": [score.as_dict() for score in scores if not score.passed],
+                        }
+                    )
+
+            if all_scores:
+                await trace_store.insert_eval_scores([score.as_dict() for score in all_scores])
+
+            aggregate = aggregate_score(all_scores, spec)
+            passed = bool(all_scores) and not failures and all(score.passed for score in all_scores)
+            finished_at = _now_iso()
+            result = {
+                "status": "passed" if passed else "failed",
+                "replay_set_id": replay_set_id,
+                "job_id": job_id,
+                "aggregate_score": aggregate,
+                "sample_count": len(replay_set.rows),
+                "validation_trace_ids": validation_trace_ids,
+                "provider": provider,
+                "model": model,
+                "adapter_run_id": adapter_run_id,
+                "adapter_capability_id": adapter_capability_id,
+                "routing_mode": routing_mode,
+                "outputs": outputs,
+                "failures": failures,
+                "started_at": started_at,
+                "finished_at": finished_at,
+            }
+            run.served_validation = result
+            run.status = "validated" if passed else "validation-failed"
+            run.error = None if passed else "served validation failed"
+            run.updated_at = finished_at
+            run_store.save(run)
+            if job_id:
+                job_store.succeed(job_id)
+            return result
+        except Exception as exc:
+            finished_at = _now_iso()
+            run.served_validation = {
+                "status": "failed",
+                "replay_set_id": replay_set_id,
+                "job_id": job_id,
+                "aggregate_score": 0.0,
+                "sample_count": len(replay_set.rows),
+                "validation_trace_ids": validation_trace_ids,
+                "provider": provider,
+                "model": model,
+                "adapter_run_id": adapter_run_id or run.id,
+                "adapter_capability_id": adapter_capability_id or run.capability_id,
+                "routing_mode": routing_mode,
+                "outputs": outputs,
+                "failures": [{"error": str(exc)}],
+                "started_at": started_at,
+                "finished_at": finished_at,
+            }
+            run.status = "validation-failed"
+            run.error = str(exc)
+            run.updated_at = finished_at
+            run_store.save(run)
+            if job_id:
+                job_store.fail(job_id, error=str(exc))
+            raise
+
+    @app.post("/v1/training-runs/{run_id}/served-validation", status_code=202)
+    async def training_runs_served_validation(
+        run_id: str, body: ServedValidationRequest
+    ) -> dict[str, Any]:
+        run_store: TrainingRunStore = app.state.training_run_store
+        replay_store: ReplaySetStore = app.state.replay_set_store
+        run = run_store.load(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"no such training run: {run_id}")
+        replay_set = replay_store.load(body.replay_set_id)
+        if replay_set is None or replay_set.capability_id != run.capability_id:
+            raise HTTPException(status_code=404, detail=f"no such replay set: {body.replay_set_id}")
+        queue = require_job_queue()
+
+        retry_payload: dict[str, Any] = {
+            "function": "run_served_validation",
+            "kwargs": {"run_id": run.id, "replay_set_id": body.replay_set_id},
+        }
+        job = create_job(
+            job_type="served_validation",
+            capability_id=run.capability_id,
+            run_id=run.id,
+            replay_set_id=body.replay_set_id,
+            max_retries=1,
+            retry_payload=retry_payload,
+        )
+        retry_payload["kwargs"]["job_id"] = job.id
+        job.retry_payload = retry_payload
+        app.state.job_store.save(job)
+
+        run.status = "validation-queued"
+        run.error = None
+        run.served_validation = {
+            "status": "queued",
+            "replay_set_id": body.replay_set_id,
+            "job_id": job.id,
+            "queued_at": _now_iso(),
+        }
+        run.updated_at = _now_iso()
+        run_store.save(run)
+
+        try:
+            await queue.enqueue_job(
+                "run_served_validation",
+                run_id=run.id,
+                replay_set_id=body.replay_set_id,
+                job_id=job.id,
+            )
+        except Exception as exc:
+            app.state.job_store.fail(job.id, error=f"queue enqueue failed: {exc}")
+            run.status = "validation-failed"
+            run.error = f"queue enqueue failed: {exc}"
+            run.updated_at = _now_iso()
+            run_store.save(run)
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return _run_to_dict(run)
+
+    @app.post("/internal/training-runs/{run_id}/served-validation/run")
+    async def internal_training_runs_served_validation_run(
+        run_id: str, body: ServedValidationRunRequest
+    ) -> dict[str, Any]:
+        return await run_served_validation_now(
+            run_id=run_id,
+            replay_set_id=body.replay_set_id,
+            job_id=body.job_id,
+        )
+
     @app.get("/v1/capabilities/{capability_id}/active-adapter")
     def capability_active_adapter(capability_id: str) -> dict[str, Any]:
         adapter_store: AdapterPointerStore = app.state.adapter_pointer_store
@@ -1411,13 +2055,24 @@ def create_app() -> FastAPI:
                 status_code=400,
                 detail=f"run {body.run_id} belongs to capability {run.capability_id}",
             )
-        if run.status not in {"trained", "promoted"}:
+        if run.status not in {"trained", "validated", "promoted"}:
             raise HTTPException(
                 status_code=409,
                 detail=f"run not in activatable state: {run.status}",
             )
         if run.artifact is None:
             raise HTTPException(status_code=409, detail="run has no artifact")
+        if not run_requires_served_validation(run):
+            raise HTTPException(
+                status_code=409,
+                detail="run has no real served adapter artifact",
+            )
+        if not run_has_served_validation(run):
+            raise HTTPException(
+                status_code=409,
+                detail=served_validation_error_detail(run)
+                or "run cannot be activated until served validation passes",
+            )
 
         adapter_store.set_active(
             capability_id,
@@ -1470,7 +2125,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="provide replay or replay_set_id")
 
         runtime = local_settings()
-        engine = EvalEngine(llm=auto_client(ollama_model=runtime.judge_model))
+        engine = EvalEngine(llm=judge_client(runtime))
         baseline_scores = []
         candidate_scores = []
         for row in replay_rows:
@@ -1662,6 +2317,17 @@ class ApplyGateRequest(BaseModel):
     baseline: dict[str, float] | None = None
 
 
+class ServedValidationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    replay_set_id: str
+
+
+class ServedValidationRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    replay_set_id: str
+    job_id: str | None = None
+
+
 class ActivateRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     run_id: str
@@ -1669,6 +2335,7 @@ class ActivateRunRequest(BaseModel):
 
 class UpdateSettingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    judge_provider: str | None = None
     judge_model: str | None = None
     embedding_model: str | None = None
     min_cluster_size: int | None = None
@@ -1721,6 +2388,7 @@ def _run_to_dict(run: TrainingRun) -> dict[str, Any]:
         "candidate": run.candidate,
         "gate_verdict": run.gate_verdict,
         "latest_comparison": run.latest_comparison,
+        "served_validation": run.served_validation,
         "allow_backend_fallback": run.allow_backend_fallback,
         "error": run.error,
     }

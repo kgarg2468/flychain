@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class LocalSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    judge_provider: str = "local-ollama"
     judge_model: str = "llama3.2:3b"
     embedding_model: str = "nomic-embed-text"
     min_cluster_size: int = Field(default=3, ge=2, le=64)

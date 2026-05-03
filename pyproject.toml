@@ -68,3 +68,9 @@ python_files = ["test_*.py", "*_test.py"]
 python_version = "3.11"
 strict = false
 ignore_missing_imports = true
+disable_error_code = ["import-untyped"]
+# Supported mypy scope is source code; pytest covers test modules.
+exclude = [
+    "apps/.*/tests/.*",
+    "packages/.*/tests/.*",
+]

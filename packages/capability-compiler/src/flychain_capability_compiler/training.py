@@ -75,12 +75,13 @@ class DryRunBackend:
         adapter_dir.mkdir(exist_ok=True)
         logs_path = output_dir / "train.log"
 
+        hyperparams = recipe.hyperparams.model_dump()
         summary = {
             "status": "dry-run",
             "recipe_id": recipe.id,
             "base_model": recipe.base_model,
             "dataset_path": str(dataset_path),
-            "hyperparams": recipe.hyperparams.model_dump(),
+            "hyperparams": hyperparams,
         }
         (adapter_dir / "adapter.json").write_text(json.dumps(summary, indent=2))
         logs_path.write_text(
@@ -98,7 +99,7 @@ class DryRunBackend:
             backend=self.name,
             adapter_dir=str(adapter_dir),
             logs_path=str(logs_path),
-            hyperparams=summary["hyperparams"],
+            hyperparams=hyperparams,
             base_model=recipe.base_model,
             dataset_path=str(dataset_path),
             dry_run=True,

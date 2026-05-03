@@ -9,6 +9,7 @@ adapter pointer per capability lives under ``pointers/<capability_id>.json``.
 
 from __future__ import annotations
 
+import builtins
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -30,6 +31,7 @@ class TrainingRun:
     candidate: dict[str, float] = field(default_factory=dict)
     gate_verdict: dict[str, Any] | None = None
     latest_comparison: dict[str, Any] | None = None
+    served_validation: dict[str, Any] | None = None
     allow_backend_fallback: bool = True
     error: str | None = None
 
@@ -50,15 +52,18 @@ class TrainingRunStore:
         if not path.exists():
             return None
         data = json.loads(path.read_text())
+        data.setdefault("served_validation", None)
         return TrainingRun(**data)
 
     def list(self) -> list[TrainingRun]:
         runs: list[TrainingRun] = []
         for path in sorted(self.directory.glob("*.json")):
-            runs.append(TrainingRun(**json.loads(path.read_text())))
+            data = json.loads(path.read_text())
+            data.setdefault("served_validation", None)
+            runs.append(TrainingRun(**data))
         return runs
 
-    def list_for_capability(self, capability_id: str) -> list[TrainingRun]:
+    def list_for_capability(self, capability_id: str) -> builtins.list[TrainingRun]:
         return [r for r in self.list() if r.capability_id == capability_id]
 
 
