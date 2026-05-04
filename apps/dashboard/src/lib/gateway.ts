@@ -113,6 +113,21 @@ export interface FailureRow {
   aggregate_score: number | null;
   failing_dimensions: string[];
   corrected_response: string | null;
+  correction_status?: 'corrected' | 'uncorrected' | string;
+  review_status?: 'needs_correction' | 'not_useful' | string;
+  cluster_ids?: string[];
+  dataset_eligible?: boolean;
+  dimension_results?: DimensionResult[];
+}
+
+export interface DimensionResult {
+  dimension: string;
+  score: number;
+  passed: boolean;
+  reason: string;
+  evaluator_type: string;
+  evaluator_source: string;
+  ts: string;
 }
 
 export interface ReplaySetRow {
@@ -170,6 +185,10 @@ export interface TrainingRunRow {
   } | null;
   allow_backend_fallback: boolean;
   error: string | null;
+  active?: boolean;
+  validation_status?: string | null;
+  gate_status?: string | null;
+  artifact_path?: string | null;
 }
 
 export interface JobRow {
@@ -241,7 +260,15 @@ export interface SettingsPayload {
     postgres_url: string;
     redis_url: string;
     data_dir: string;
+    health?: RuntimeHealthComponent[];
   };
+}
+
+export interface RuntimeHealthComponent {
+  name: string;
+  status: string;
+  target?: string;
+  detail?: string;
 }
 
 export interface ChatMessage {
@@ -292,6 +319,198 @@ export interface ChatCompletionResult {
     provider: string | null;
     model: string | null;
   };
+}
+
+export interface TraceEvalResponse {
+  trace_id: string;
+  capability_id?: string | null;
+  trace?: TraceRow;
+  eval_status: 'pending' | 'passed' | 'failed' | string;
+  passed?: boolean | null;
+  aggregate_score?: number | null;
+  failure_status?: string;
+  scores: DimensionResult[];
+}
+
+export interface FlywheelTimelineStep {
+  id: string;
+  label: string;
+  status: string;
+  count: number;
+  latest_ts?: string | null;
+  action_needed?: string | null;
+  href: string;
+}
+
+export interface FlywheelCluster extends ClusterSummary {
+  representative_failures?: FailureRow[];
+  correction_coverage?: { corrected: number; total: number };
+  dataset_eligible?: boolean;
+  latest_dataset_id?: string | null;
+}
+
+export interface FlywheelDataset extends DatasetEntry {
+  training_run_ids?: string[];
+  correction_source?: { human: number; generated: number };
+}
+
+export interface BeforeAfterComparison {
+  run_id?: string;
+  trace_id?: string | null;
+  replay_trace_id?: string | null;
+  input?: string | null;
+  baseline_output?: string | null;
+  adapted_output?: string | null;
+  evaluator_scores?: DimensionResult[];
+  adapter_proof?: Record<string, unknown>;
+  final_verdict?: string | null;
+  comparison?: Record<string, unknown>;
+}
+
+export interface FlywheelSnapshot {
+  capability_id: string;
+  capability: CapabilitySpec;
+  summary: {
+    total_traces: number;
+    evaluated_traces: number;
+    failing_traces: number;
+    unresolved_failures: number;
+    clusters: number;
+    datasets: number;
+    training_runs: number;
+    latest_served_validation?: (TrainingRunRow['served_validation'] & { run_id?: string }) | null;
+    active_adapter?: ActiveAdapter['active'] | null;
+    last_adapted_chat?: {
+      trace_id: string;
+      provider?: string | null;
+      model?: string | null;
+      ts?: string | null;
+    } | null;
+  };
+  timeline: FlywheelTimelineStep[];
+  traces: TraceRow[];
+  failures: FailureRow[];
+  clusters: FlywheelCluster[];
+  datasets: FlywheelDataset[];
+  training_runs: TrainingRunRow[];
+  jobs: JobRow[];
+  active_adapter: ActiveAdapter;
+  before_after?: BeforeAfterComparison | null;
+}
+
+export type GuidedActionType =
+  | 'create_dataset'
+  | 'start_training'
+  | 'run_served_validation'
+  | 'promote_adapter'
+  | string;
+
+export type GuidedActionStatus = 'available' | 'blocked' | 'running' | 'complete' | string;
+
+export interface GuidedAction {
+  id: string;
+  type: GuidedActionType;
+  target_id: string;
+  status: GuidedActionStatus;
+  requires_approval: boolean;
+  reason: string;
+  blocked_reasons: string[];
+  preview: Record<string, unknown>;
+  default_params: Record<string, unknown>;
+}
+
+export interface GuidedActionsResponse {
+  capability_id: string;
+  readiness: {
+    min_cluster_size?: number;
+    active_adapter_run_id?: string | null;
+    [key: string]: unknown;
+  };
+  thresholds: {
+    min_corrected_failures: number;
+    [key: string]: unknown;
+  };
+  active_adapter: ActiveAdapter;
+  actions: GuidedAction[];
+}
+
+export interface GuidedActionExecuteResponse {
+  capability_id: string;
+  action: GuidedAction;
+  result: Record<string, unknown>;
+}
+
+export interface AutopilotPolicy {
+  capability_id: string;
+  enabled: boolean;
+  min_corrected_failures: number;
+  min_cluster_size: number;
+  allowed_training_recipes: string[];
+  auto_generate_corrections: boolean;
+  allow_generated_corrections: boolean;
+  auto_create_dataset: boolean;
+  auto_start_training: boolean;
+  auto_run_served_validation: boolean;
+  auto_promote: boolean;
+  require_promotion_approval: boolean;
+  allow_dry_run_fallback: boolean;
+  require_served_validation: boolean;
+  max_training_runs_per_day: number;
+  promotion_cooldown_seconds: number;
+  rollback_mode: 'disable_current' | 'restore_previous' | string;
+  version: number;
+  updated_at: string;
+}
+
+export interface AutopilotDecision {
+  id: string;
+  capability_id?: string;
+  trigger: string;
+  policy_version: number;
+  action: string;
+  outcome: string;
+  reasons: string[];
+  input_counts: Record<string, number>;
+  target_id?: string | null;
+  job_ids: string[];
+  approval_status?: string | null;
+  approval_note?: string | null;
+  approved_at?: string | null;
+  result: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AutopilotStatusResponse {
+  capability_id: string;
+  policy: AutopilotPolicy;
+  readiness: Record<string, number>;
+  latest_decision: AutopilotDecision | null;
+  pending_approval: AutopilotDecision | null;
+  audit: AutopilotDecision[];
+}
+
+export interface AutopilotPolicyResponse {
+  capability_id: string;
+  policy: AutopilotPolicy;
+}
+
+export interface AutopilotRunResponse {
+  status: string;
+  decision: AutopilotDecision;
+}
+
+export interface AutopilotApprovalResponse {
+  capability_id: string;
+  active_run_id?: string;
+  decision: AutopilotDecision | Record<string, unknown>;
+}
+
+export interface RollbackResponse {
+  capability_id: string;
+  status: string;
+  active?: ActiveAdapter['active'] | null;
+  decision: AutopilotDecision | Record<string, unknown>;
 }
 
 function gatewayBaseUrl(): string {
@@ -435,6 +654,112 @@ export const gateway = {
   async failures(id: string): Promise<{ capability_id: string; failures: FailureRow[] }> {
     return request<{ capability_id: string; failures: FailureRow[] }>(
       `/v1/capabilities/${encodeURIComponent(id)}/failures`,
+    );
+  },
+  async flywheel(id: string): Promise<FlywheelSnapshot> {
+    return request<FlywheelSnapshot>(`/v1/capabilities/${encodeURIComponent(id)}/flywheel`);
+  },
+  async guidedActions(id: string): Promise<GuidedActionsResponse> {
+    return request<GuidedActionsResponse>(
+      `/v1/capabilities/${encodeURIComponent(id)}/guided-actions`,
+    );
+  },
+  async executeGuidedAction(
+    id: string,
+    actionId: string,
+    args: { approved?: boolean } = {},
+  ): Promise<GuidedActionExecuteResponse> {
+    return request<GuidedActionExecuteResponse>(
+      `/v1/capabilities/${encodeURIComponent(id)}/guided-actions/${encodeURIComponent(actionId)}/execute`,
+      {
+        method: 'POST',
+        body: JSON.stringify(args),
+      },
+    );
+  },
+  async autopilotStatus(id: string): Promise<AutopilotStatusResponse> {
+    return request<AutopilotStatusResponse>(`/v1/capabilities/${encodeURIComponent(id)}/autopilot`);
+  },
+  async autopilotAudit(id: string): Promise<{ capability_id: string; audit: AutopilotDecision[] }> {
+    return request<{ capability_id: string; audit: AutopilotDecision[] }>(
+      `/v1/capabilities/${encodeURIComponent(id)}/autopilot/audit`,
+    );
+  },
+  async updateAutopilotPolicy(
+    id: string,
+    patch: Partial<AutopilotPolicy>,
+  ): Promise<AutopilotPolicyResponse> {
+    return request<AutopilotPolicyResponse>(
+      `/v1/capabilities/${encodeURIComponent(id)}/autopilot-policy`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(patch),
+      },
+    );
+  },
+  async runAutopilot(id: string, trigger = 'manual'): Promise<AutopilotRunResponse> {
+    return request<AutopilotRunResponse>(
+      `/v1/capabilities/${encodeURIComponent(id)}/autopilot/run`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ trigger }),
+      },
+    );
+  },
+  async approveAutopilot(
+    id: string,
+    decisionId: string,
+    args: { approved: boolean; note?: string },
+  ): Promise<AutopilotApprovalResponse> {
+    return request<AutopilotApprovalResponse>(
+      `/v1/capabilities/${encodeURIComponent(id)}/autopilot/approvals/${encodeURIComponent(decisionId)}`,
+      {
+        method: 'POST',
+        body: JSON.stringify(args),
+      },
+    );
+  },
+  async rollbackCapability(
+    id: string,
+    args: { reason: string; mode?: 'disable_current' | 'restore_previous' },
+  ): Promise<RollbackResponse> {
+    return request<RollbackResponse>(`/v1/capabilities/${encodeURIComponent(id)}/rollback`, {
+      method: 'POST',
+      body: JSON.stringify(args),
+    });
+  },
+  async traceEvals(traceId: string, capabilityId?: string): Promise<TraceEvalResponse> {
+    const search = new URLSearchParams();
+    if (capabilityId) search.set('capability_id', capabilityId);
+    const qs = search.toString();
+    return request<TraceEvalResponse>(
+      `/v1/traces/${encodeURIComponent(traceId)}/evals${qs ? `?${qs}` : ''}`,
+    );
+  },
+  async submitFeedback(args: {
+    trace_id: string;
+    project_id?: string;
+    thumb?: 'up' | 'down' | 'none';
+    score?: number;
+    comment?: string;
+    corrected_response?: string;
+  }): Promise<{ feedback_id: string; trace_id: string; recorded: boolean }> {
+    return request('/v1/feedback', {
+      method: 'POST',
+      body: JSON.stringify(args),
+    });
+  },
+  async reviewFailure(
+    capabilityId: string,
+    traceId: string,
+    args: { status: 'needs_correction' | 'not_useful'; note?: string },
+  ): Promise<{ capability_id: string; trace_id: string; status: string; note: string }> {
+    return request(
+      `/v1/capabilities/${encodeURIComponent(capabilityId)}/failures/${encodeURIComponent(traceId)}/review`,
+      {
+        method: 'POST',
+        body: JSON.stringify(args),
+      },
     );
   },
   async clusterRun(

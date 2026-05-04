@@ -21,6 +21,7 @@ vi.mock('@/lib/gateway', async () => {
     gateway: {
       ...actual.gateway,
       chatCompletion: vi.fn(),
+      traceEvals: vi.fn(),
     },
   };
 });
@@ -42,6 +43,12 @@ const capabilities: CapabilitySpec[] = [
 describe('ChatClient', () => {
   beforeEach(() => {
     vi.mocked(gateway.chatCompletion).mockReset();
+    vi.mocked((gateway as typeof gateway & { traceEvals: ReturnType<typeof vi.fn> }).traceEvals)
+      .mockReset()
+      .mockResolvedValue({
+        eval_status: 'pending',
+        scores: [],
+      });
   });
 
   it('renders the default chat controls and composer', () => {
@@ -79,6 +86,27 @@ describe('ChatClient', () => {
         model: 'mlx-community/Llama-3.2-3B-Instruct-4bit',
       },
     });
+    vi.mocked(
+      (gateway as typeof gateway & { traceEvals: ReturnType<typeof vi.fn> }).traceEvals,
+    ).mockResolvedValue({
+      trace_id: 'trace_123',
+      capability_id: 'groundedness',
+      eval_status: 'passed',
+      passed: true,
+      aggregate_score: 1,
+      failure_status: 'passing',
+      scores: [
+        {
+          dimension: 'all_claims_supported',
+          score: 1,
+          passed: true,
+          reason: 'exact match',
+          evaluator_type: 'deterministic',
+          evaluator_source: 'deterministic:exact_match',
+          ts: '2026-05-03T00:00:00+00:00',
+        },
+      ],
+    });
 
     render(<ChatClient capabilities={capabilities} loadError={null} />);
 
@@ -92,6 +120,9 @@ describe('ChatClient', () => {
       capabilityIds: ['groundedness'],
       tags: 'source=dashboard-chat',
     });
+    expect(
+      (gateway as typeof gateway & { traceEvals: ReturnType<typeof vi.fn> }).traceEvals,
+    ).toHaveBeenCalledWith('trace_123', 'groundedness');
     expect(await screen.findByText('Use the 30 day refund window.')).toBeInTheDocument();
     const assistantMessage = screen.getByText('Use the 30 day refund window.').closest('article');
     expect(within(assistantMessage as HTMLElement).getByText(/trace_123/i)).toBeInTheDocument();
@@ -99,8 +130,19 @@ describe('ChatClient', () => {
     expect(
       within(assistantMessage as HTMLElement).getByText(/adapter run_mlx/i),
     ).toBeInTheDocument();
+    expect(within(assistantMessage as HTMLElement).getByText(/local-mlx/i)).toBeInTheDocument();
     expect(
-      within(assistantMessage as HTMLElement).getByText(/local-mlx/i),
+      within(assistantMessage as HTMLElement).getByText(
+        /mlx-community\/Llama-3.2-3B-Instruct-4bit/i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(assistantMessage as HTMLElement).getByText(/adapter capability groundedness/i),
+    ).toBeInTheDocument();
+    expect(within(assistantMessage as HTMLElement).getAllByText(/groundedness/i)).toHaveLength(2);
+    expect(within(assistantMessage as HTMLElement).getByText(/eval passed/i)).toBeInTheDocument();
+    expect(
+      within(assistantMessage as HTMLElement).getByText(/deterministic:exact_match/i),
     ).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /view trace/i })).toHaveAttribute(
       'href',

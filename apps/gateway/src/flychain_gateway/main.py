@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import socket
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -38,6 +41,7 @@ from pydantic import BaseModel, ConfigDict
 from ulid import ULID
 
 from flychain_gateway import __version__
+from flychain_gateway.autopilot_store import AutopilotPolicy, AutopilotStore
 from flychain_gateway.capability_store import (
     CapabilityExistsError,
     CapabilityNotFoundError,
@@ -47,6 +51,7 @@ from flychain_gateway.capability_store import (
 )
 from flychain_gateway.cluster_store import ClusterStore, DatasetStore
 from flychain_gateway.config import Settings, get_settings
+from flychain_gateway.failure_review_store import FailureReviewStore
 from flychain_gateway.job_store import JobRecord, JobStore
 from flychain_gateway.models_registry import ModelNotFoundError, ModelRegistry, get_registry
 from flychain_gateway.otel import get_tracer, make_llm_attributes, setup_tracing
@@ -113,6 +118,79 @@ def _redis_settings_from_url(url: str) -> RedisSettings:
         port=parsed.port or 6379,
         database=int((parsed.path or "/0").lstrip("/") or 0),
     )
+
+
+def _component_health(
+    name: str,
+    status: str,
+    *,
+    target: str | None = None,
+    detail: str | None = None,
+) -> dict[str, str]:
+    row = {"name": name, "status": status}
+    if target:
+        row["target"] = target
+    if detail:
+        row["detail"] = detail
+    return row
+
+
+def _tcp_health(name: str, url: str, *, default_port: int) -> dict[str, str]:
+    parsed = urlparse(url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or default_port
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return _component_health(name, "ok", target=url)
+    except OSError as exc:
+        return _component_health(name, "down", target=url, detail=str(exc))
+
+
+def _http_health(name: str, base_url: str | None, path: str) -> dict[str, str]:
+    if not base_url:
+        return _component_health(name, "not_configured")
+    target = base_url.rstrip("/")
+    try:
+        resp = httpx.get(f"{target}{path}", timeout=0.8)
+    except httpx.HTTPError as exc:
+        return _component_health(name, "down", target=target, detail=str(exc))
+    status = "ok" if resp.status_code < 500 else "degraded"
+    return _component_health(name, status, target=target, detail=f"http {resp.status_code}")
+
+
+def _clickhouse_health(store: TraceStore) -> dict[str, str]:
+    client = getattr(store, "_client", None)
+    if client is None:
+        return _component_health(
+            "ClickHouse",
+            "degraded",
+            target=store.url,
+            detail="using in-memory trace buffer",
+        )
+    try:
+        client.ping()
+    except Exception as exc:  # pragma: no cover - depends on local service state
+        return _component_health("ClickHouse", "down", target=store.url, detail=str(exc))
+    return _component_health("ClickHouse", "ok", target=store.url)
+
+
+def _runtime_health(app: FastAPI, settings: Settings) -> list[dict[str, str]]:
+    redis = _tcp_health("Redis", settings.redis_url, default_port=6379)
+    job_queue = getattr(app.state, "job_queue", None)
+    if job_queue is None:
+        jobs = _component_health("Background jobs", "disabled", detail="Redis queue unavailable")
+    else:
+        jobs = _component_health("Background jobs", "ok", target=settings.redis_url)
+
+    return [
+        _component_health("Gateway", "ok"),
+        jobs,
+        _clickhouse_health(app.state.trace_store),
+        redis,
+        _tcp_health("Postgres", settings.postgres_url, default_port=5432),
+        _http_health("Ollama", settings.ollama_url, "/v1/models"),
+        _http_health("MLX server", settings.mlx_server_url, "/v1/models"),
+    ]
 
 
 def _flatten_content(content: Any) -> str:
@@ -215,7 +293,9 @@ async def lifespan(app: FastAPI):
     dataset_store = DatasetStore(data_root / "datasets")
     training_run_store = TrainingRunStore(data_root / "runs")
     adapter_pointer_store = AdapterPointerStore(data_root / "pointers")
+    autopilot_store = AutopilotStore(data_root / "autopilot")
     replay_set_store = ReplaySetStore(data_root / "replay-sets")
+    failure_review_store = FailureReviewStore(data_root / "failure-reviews")
     local_settings_store = SettingsStore(data_root / "settings.json")
     job_store = JobStore(data_root / "jobs")
     job_queue: ArqRedis | None = None
@@ -234,7 +314,9 @@ async def lifespan(app: FastAPI):
     app.state.dataset_store = dataset_store
     app.state.training_run_store = training_run_store
     app.state.adapter_pointer_store = adapter_pointer_store
+    app.state.autopilot_store = autopilot_store
     app.state.replay_set_store = replay_set_store
+    app.state.failure_review_store = failure_review_store
     app.state.local_settings_store = local_settings_store
     app.state.job_store = job_store
     app.state.job_queue = job_queue
@@ -378,6 +460,83 @@ def create_app() -> FastAPI:
                 break
         return collected
 
+    def cluster_ids_by_trace(capability_id: str) -> dict[str, list[str]]:
+        cluster_store: ClusterStore = app.state.cluster_store
+        stored = cluster_store.load(capability_id) or {}
+        mapping: dict[str, list[str]] = {}
+        for cluster in stored.get("clusters", []):
+            cluster_id = str(cluster.get("id", ""))
+            for trace_id in cluster.get("trace_ids", []) or []:
+                mapping.setdefault(str(trace_id), []).append(cluster_id)
+        return mapping
+
+    def latest_feedback_by_trace() -> dict[str, dict[str, Any]]:
+        trace_store: TraceStore = app.state.trace_store
+        feedback_rows = sorted(
+            trace_store.list_feedback(),
+            key=lambda row: row.get("ts", ""),
+            reverse=True,
+        )
+        feedback_by_trace: dict[str, dict[str, Any]] = {}
+        for row in feedback_rows:
+            feedback_by_trace.setdefault(row["trace_id"], row)
+        return feedback_by_trace
+
+    def review_status_by_trace(capability_id: str) -> dict[str, str]:
+        review_store: FailureReviewStore = app.state.failure_review_store
+        return {
+            review.trace_id: review.status
+            for review in review_store.list_for_capability(capability_id)
+        }
+
+    def eval_score_summary(
+        *,
+        trace_id: str,
+        capability_id: str | None = None,
+    ) -> dict[str, Any]:
+        trace_store: TraceStore = app.state.trace_store
+        scores = trace_store.list_eval_scores(trace_id=trace_id, capability_id=capability_id)
+        traces = [row for row in list_all_traces() if row["trace_id"] == trace_id]
+        if not traces:
+            raise HTTPException(status_code=404, detail=f"no such trace: {trace_id}")
+
+        trace_row = traces[0]
+        if not scores:
+            return {
+                "trace_id": trace_id,
+                "capability_id": capability_id,
+                "trace": trace_row,
+                "eval_status": "pending",
+                "passed": None,
+                "aggregate_score": None,
+                "failure_status": "pending",
+                "scores": [],
+            }
+
+        passed = all(bool(row["passed"]) for row in scores)
+        aggregate = sum(float(row["score"]) for row in scores) / len(scores)
+        return {
+            "trace_id": trace_id,
+            "capability_id": capability_id,
+            "trace": trace_row,
+            "eval_status": "passed" if passed else "failed",
+            "passed": passed,
+            "aggregate_score": aggregate,
+            "failure_status": "passing" if passed else "failing",
+            "scores": [dimension_result(row) for row in scores],
+        }
+
+    def dimension_result(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "dimension": row["dimension"],
+            "score": float(row["score"]),
+            "passed": bool(row["passed"]),
+            "reason": row.get("reason", "") or "",
+            "evaluator_type": row.get("evaluator_type", "llm_judge") or "llm_judge",
+            "evaluator_source": row.get("evaluator_source") or row.get("judge_model", "") or "",
+            "ts": row.get("ts", ""),
+        }
+
     def derive_failures(capability_id: str) -> list[dict[str, Any]]:
         capability_store: CapabilityStore = app.state.capability_store
         trace_store: TraceStore = app.state.trace_store
@@ -396,14 +555,9 @@ def create_app() -> FastAPI:
             grouped[row["trace_id"]].setdefault(row["dimension"], row)
 
         traces = {row["trace_id"]: row for row in list_all_traces(capability_id=capability_id)}
-        feedback_rows = sorted(
-            trace_store.list_feedback(),
-            key=lambda row: row.get("ts", ""),
-            reverse=True,
-        )
-        feedback_by_trace: dict[str, dict[str, Any]] = {}
-        for row in feedback_rows:
-            feedback_by_trace.setdefault(row["trace_id"], row)
+        feedback_by_trace = latest_feedback_by_trace()
+        trace_cluster_ids = cluster_ids_by_trace(capability_id)
+        trace_review_status = review_status_by_trace(capability_id)
 
         weights = {dimension.id: float(dimension.weight) for dimension in spec.eval_dimensions}
         failures: list[dict[str, Any]] = []
@@ -425,6 +579,10 @@ def create_app() -> FastAPI:
                 weighted_score += float(row["score"]) * weight
 
             feedback = feedback_by_trace.get(trace_id, {})
+            corrected_response = feedback.get("corrected_response") or None
+            correction_status = "corrected" if corrected_response else "uncorrected"
+            correction_source = feedback.get("correction_source") or "human"
+            review_status = trace_review_status.get(trace_id, "needs_correction")
             failures.append(
                 {
                     "trace_id": trace_id,
@@ -441,7 +599,22 @@ def create_app() -> FastAPI:
                     "ts": trace.get("ts") or max(row.get("ts", "") for row in dim_rows.values()),
                     "aggregate_score": (weighted_score / total_weight) if total_weight else None,
                     "failing_dimensions": failing_dimensions,
-                    "corrected_response": feedback.get("corrected_response") or None,
+                    "corrected_response": corrected_response,
+                    "correction_status": correction_status,
+                    "correction_source": correction_source if corrected_response else None,
+                    "correction_metadata": feedback.get("correction_metadata") or "",
+                    "review_status": review_status,
+                    "cluster_ids": trace_cluster_ids.get(trace_id, []),
+                    "dataset_eligible": correction_status == "corrected"
+                    and review_status != "not_useful"
+                    and correction_source != "generated",
+                    "dimension_results": [
+                        dimension_result(row)
+                        for row in sorted(
+                            dim_rows.values(),
+                            key=lambda item: str(item.get("dimension", "")),
+                        )
+                    ],
                 }
             )
 
@@ -491,6 +664,189 @@ def create_app() -> FastAPI:
         if not errors:
             return ""
         return "served validation proof is incomplete: " + "; ".join(errors)
+
+    def enrich_clusters(
+        clusters: list[dict[str, Any]],
+        *,
+        datasets: list[dict[str, Any]],
+        failure_by_trace: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        enriched: list[dict[str, Any]] = []
+        for cluster in clusters:
+            trace_ids = [str(trace_id) for trace_id in cluster.get("trace_ids", [])]
+            failures = [failure_by_trace[trace_id] for trace_id in trace_ids if trace_id in failure_by_trace]
+            corrected = [
+                failure
+                for failure in failures
+                if failure.get("correction_status") == "corrected"
+                and failure.get("review_status") != "not_useful"
+            ]
+            related_datasets = [
+                dataset for dataset in datasets if dataset.get("cluster_id") == cluster.get("id")
+            ]
+            latest_dataset = related_datasets[-1] if related_datasets else None
+            row = dict(cluster)
+            row["representative_failures"] = failures[:3]
+            row["correction_coverage"] = {
+                "corrected": len(corrected),
+                "total": len(trace_ids),
+            }
+            row["dataset_eligible"] = bool(trace_ids) and len(corrected) == len(trace_ids)
+            row["latest_dataset_id"] = latest_dataset.get("id") if latest_dataset else None
+            return_trace_ids = [failure["trace_id"] for failure in failures]
+            row["reviewed_trace_ids"] = return_trace_ids
+            enriched.append(row)
+        return enriched
+
+    def enrich_datasets(
+        datasets: list[dict[str, Any]],
+        *,
+        runs: list[TrainingRun],
+        clusters: list[dict[str, Any]],
+        failure_by_trace: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        clusters_by_id = {cluster.get("id"): cluster for cluster in clusters}
+        rows: list[dict[str, Any]] = []
+        for dataset in datasets:
+            cluster = clusters_by_id.get(dataset.get("cluster_id"))
+            trace_ids = list(cluster.get("trace_ids", [])) if cluster else []
+            human_count = sum(
+                1
+                for trace_id in trace_ids
+                if failure_by_trace.get(trace_id, {}).get("correction_status") == "corrected"
+                and failure_by_trace.get(trace_id, {}).get("correction_source", "human")
+                != "generated"
+            )
+            generated_count = sum(
+                1
+                for trace_id in trace_ids
+                if failure_by_trace.get(trace_id, {}).get("correction_status") == "corrected"
+                and failure_by_trace.get(trace_id, {}).get("correction_source") == "generated"
+            )
+            row_count = int(dataset.get("row_count") or 0)
+            training_run_ids = [run.id for run in runs if run.dataset_id == dataset.get("id")]
+            row = dict(dataset)
+            row["training_run_ids"] = training_run_ids
+            row["correction_source"] = {
+                "human": human_count,
+                "generated": generated_count
+                if generated_count
+                else max(row_count - human_count, 0),
+            }
+            rows.append(row)
+        return rows
+
+    def enrich_training_run(run: TrainingRun, *, active_run_id: str | None) -> dict[str, Any]:
+        row = _run_to_dict(run)
+        row["active"] = run.id == active_run_id
+        row["validation_status"] = (
+            run.served_validation.get("status")
+            if isinstance(run.served_validation, dict)
+            else None
+        )
+        row["gate_status"] = (
+            run.gate_verdict.get("decision")
+            if isinstance(run.gate_verdict, dict)
+            else None
+        )
+        row["artifact_path"] = (
+            run.artifact.get("adapter_dir")
+            if isinstance(run.artifact, dict)
+            else None
+        )
+        return row
+
+    def latest_served_validation(runs: list[TrainingRun]) -> dict[str, Any] | None:
+        candidates = [run for run in runs if isinstance(run.served_validation, dict)]
+
+        def served_validation_sort_key(run: TrainingRun) -> str:
+            validation = run.served_validation
+            if not isinstance(validation, dict):
+                return str(run.updated_at)
+            return str(
+                validation.get("finished_at")
+                or validation.get("queued_at")
+                or run.updated_at
+            )
+
+        candidates.sort(
+            key=served_validation_sort_key,
+            reverse=True,
+        )
+        if not candidates:
+            return None
+        run = candidates[0]
+        result = dict(run.served_validation or {})
+        result["run_id"] = run.id
+        return result
+
+    def last_adapted_chat(traces: list[dict[str, Any]]) -> dict[str, Any] | None:
+        for trace in traces:
+            request_payload = _payload_dict(trace.get("request"))
+            if trace.get("provider") == "local-mlx" or request_payload.get("adapters"):
+                return {
+                    "trace_id": trace["trace_id"],
+                    "provider": trace.get("provider"),
+                    "model": trace.get("model"),
+                    "ts": trace.get("ts"),
+                }
+        return None
+
+    def latest_before_after(
+        runs: list[TrainingRun], *, active_run_id: str | None
+    ) -> dict[str, Any] | None:
+        ordered = sorted(
+            runs,
+            key=lambda run: (run.id == active_run_id, run.updated_at),
+            reverse=True,
+        )
+        for run in ordered:
+            validation = run.served_validation if isinstance(run.served_validation, dict) else None
+            if validation is not None:
+                rows = validation.get("rows")
+                if isinstance(rows, list) and rows:
+                    row = dict(rows[0])
+                    return {
+                        "run_id": run.id,
+                        "trace_id": row.get("trace_id"),
+                        "replay_trace_id": row.get("replay_trace_id"),
+                        "input": row.get("input"),
+                        "baseline_output": row.get("baseline_output"),
+                        "adapted_output": row.get("adapted_output") or row.get("served_output"),
+                        "evaluator_scores": row.get("scores", []),
+                        "adapter_proof": row.get("adapter_proof", {}),
+                        "final_verdict": row.get("verdict") or validation.get("status"),
+                    }
+            if isinstance(run.latest_comparison, dict):
+                comparison = dict(run.latest_comparison)
+                return {
+                    "run_id": run.id,
+                    "baseline_output": None,
+                    "adapted_output": None,
+                    "evaluator_scores": [],
+                    "adapter_proof": validation or {},
+                    "final_verdict": validation.get("status") if validation else None,
+                    "comparison": comparison,
+                }
+        return None
+
+    def timeline_step(
+        step_id: str,
+        label: str,
+        count: int,
+        rows: list[dict[str, Any]],
+        href: str,
+    ) -> dict[str, Any]:
+        latest = max((str(row.get("ts") or row.get("updated_at") or "") for row in rows), default="")
+        return {
+            "id": step_id,
+            "label": label,
+            "status": "complete" if count > 0 else "pending",
+            "count": count,
+            "latest_ts": latest or None,
+            "action_needed": None if count > 0 else "No evidence yet",
+            "href": href,
+        }
 
     async def maybe_auto_cluster_failures(
         *, specs: list[CapabilitySpec], failed_capability_ids: set[str]
@@ -701,6 +1057,1120 @@ def create_app() -> FastAPI:
                     trace_ids=list(cluster["trace_ids"]),
                 )
         raise HTTPException(status_code=404, detail=f"no such cluster: {cluster_id}")
+
+    def guided_action_id(action_type: str, target_id: str) -> str:
+        return f"{action_type}:{target_id}"
+
+    def parse_guided_action_id(action_id: str) -> tuple[str, str]:
+        if ":" not in action_id:
+            raise HTTPException(status_code=400, detail="guided action id is invalid")
+        action_type, target_id = action_id.split(":", 1)
+        if not action_type or not target_id:
+            raise HTTPException(status_code=400, detail="guided action id is invalid")
+        return action_type, target_id
+
+    def guided_dataset_rows(path: str | Path) -> list[dict[str, Any]]:
+        dataset_path = Path(path)
+        if not dataset_path.exists():
+            raise HTTPException(status_code=409, detail=f"dataset file is missing: {path}")
+        rows: list[dict[str, Any]] = []
+        for line in dataset_path.read_text().splitlines():
+            if line.strip():
+                value = json.loads(line)
+                if isinstance(value, dict):
+                    rows.append(value)
+        return rows
+
+    def guided_row_prompt(row: dict[str, Any]) -> str:
+        prompt = row.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            return prompt.strip()
+        messages = row.get("messages")
+        if isinstance(messages, list):
+            return _chat_input_text(messages)
+        return ""
+
+    def guided_row_completion(row: dict[str, Any]) -> str:
+        completion = row.get("completion")
+        if isinstance(completion, str) and completion.strip():
+            return completion.strip()
+        chosen = row.get("chosen")
+        if isinstance(chosen, str) and chosen.strip():
+            return chosen.strip()
+        messages = row.get("messages")
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                if isinstance(message, dict) and message.get("role") == "assistant":
+                    return _flatten_content(message.get("content"))
+        return ""
+
+    def guided_cluster_failures(
+        capability_id: str, cluster: Cluster
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        failure_by_trace = {row["trace_id"]: row for row in derive_failures(capability_id)}
+        included: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for trace_id in cluster.trace_ids:
+            failure = failure_by_trace.get(trace_id)
+            if failure is None:
+                skipped.append({"trace_id": trace_id, "reason": "missing_failure_evidence"})
+                continue
+            if failure.get("review_status") == "not_useful":
+                skipped.append({"trace_id": trace_id, "reason": "not_useful"})
+                continue
+            if failure.get("correction_status") != "corrected":
+                skipped.append({"trace_id": trace_id, "reason": "missing_human_correction"})
+                continue
+            if not failure.get("dataset_eligible"):
+                skipped.append({"trace_id": trace_id, "reason": "dataset_blocked"})
+                continue
+            included.append(failure)
+        return included, skipped
+
+    def select_guided_recipe(spec: CapabilitySpec, dataset: dict[str, Any]):
+        method = str(dataset.get("method") or "sft").lower()
+        recipe_refs = [
+            str(ref).removesuffix(".yaml")
+            for ref in (spec.recipe_refs or [])
+            if str(ref).strip()
+        ]
+        preferred_ids = (
+            ["sft-mlx-lora-local-3b", *recipe_refs]
+            if method == "sft"
+            else recipe_refs
+        )
+        seen: set[str] = set()
+        for recipe_id in preferred_ids:
+            if recipe_id in seen:
+                continue
+            seen.add(recipe_id)
+            try:
+                recipe = recipe_by_id(recipe_id)
+            except KeyError:
+                continue
+            if str(recipe.method.value) == method:
+                return recipe
+        for recipe in list_recipes():
+            if str(recipe.method.value) == method:
+                return recipe
+        raise HTTPException(status_code=409, detail=f"no compatible recipe for {method} dataset")
+
+    async def queue_training_run(body: CreateTrainingRun) -> TrainingRun:
+        capability_store: CapabilityStore = app.state.capability_store
+        dataset_store: DatasetStore = app.state.dataset_store
+        run_store: TrainingRunStore = app.state.training_run_store
+
+        try:
+            _spec = capability_store.get(body.capability_id)
+        except CapabilityNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"no such capability: {exc}") from exc
+
+        try:
+            recipe = recipe_by_id(body.recipe_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"no such recipe: {exc}") from exc
+
+        dataset_path = dataset_store.resolve_path(body.dataset_id)
+        if dataset_path is None:
+            raise HTTPException(status_code=404, detail=f"no such dataset: {body.dataset_id}")
+        queue = require_job_queue()
+
+        run_id = f"run_{ULID()}"
+        now = _now_iso()
+        run = TrainingRun(
+            id=run_id,
+            capability_id=body.capability_id,
+            recipe_id=recipe.id,
+            dataset_id=body.dataset_id,
+            dataset_path=str(dataset_path),
+            status="queued",
+            created_at=now,
+            updated_at=now,
+            artifact=None,
+            baseline=dict(body.baseline or {}),
+            candidate={},
+            allow_backend_fallback=body.allow_backend_fallback,
+        )
+        run_store.save(run)
+
+        job = create_job(
+            job_type="training",
+            capability_id=run.capability_id,
+            dataset_id=run.dataset_id,
+            run_id=run.id,
+            max_retries=0,
+            retry_payload={"function": "run_training_recipe", "kwargs": {"run_id": run.id}},
+        )
+        job.retry_payload = {
+            "function": "run_training_recipe",
+            "kwargs": {"run_id": run.id, "job_id": job.id},
+        }
+        app.state.job_store.save(job)
+
+        try:
+            await queue.enqueue_job("run_training_recipe", run_id=run.id, job_id=job.id)
+        except Exception as exc:
+            app.state.job_store.fail(job.id, error=f"queue enqueue failed: {exc}")
+            run.status = "failed"
+            run.error = f"queue enqueue failed: {exc}"
+            run.updated_at = _now_iso()
+            run_store.save(run)
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        return run
+
+    async def queue_served_validation(run_id: str, replay_set_id: str) -> TrainingRun:
+        run_store: TrainingRunStore = app.state.training_run_store
+        replay_store: ReplaySetStore = app.state.replay_set_store
+        run = run_store.load(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"no such training run: {run_id}")
+        replay_set = replay_store.load(replay_set_id)
+        if replay_set is None or replay_set.capability_id != run.capability_id:
+            raise HTTPException(status_code=404, detail=f"no such replay set: {replay_set_id}")
+        queue = require_job_queue()
+
+        retry_payload: dict[str, Any] = {
+            "function": "run_served_validation",
+            "kwargs": {"run_id": run.id, "replay_set_id": replay_set_id},
+        }
+        job = create_job(
+            job_type="served_validation",
+            capability_id=run.capability_id,
+            run_id=run.id,
+            replay_set_id=replay_set_id,
+            max_retries=1,
+            retry_payload=retry_payload,
+        )
+        retry_payload["kwargs"]["job_id"] = job.id
+        job.retry_payload = retry_payload
+        app.state.job_store.save(job)
+
+        run.status = "validation-queued"
+        run.error = None
+        run.served_validation = {
+            "status": "queued",
+            "replay_set_id": replay_set_id,
+            "job_id": job.id,
+            "queued_at": _now_iso(),
+        }
+        run.updated_at = _now_iso()
+        run_store.save(run)
+
+        try:
+            await queue.enqueue_job(
+                "run_served_validation",
+                run_id=run.id,
+                replay_set_id=replay_set_id,
+                job_id=job.id,
+            )
+        except Exception as exc:
+            app.state.job_store.fail(job.id, error=f"queue enqueue failed: {exc}")
+            run.status = "validation-failed"
+            run.error = f"queue enqueue failed: {exc}"
+            run.updated_at = _now_iso()
+            run_store.save(run)
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return run
+
+    def managed_replay_set_for_run(run: TrainingRun) -> ReplaySet:
+        dataset_store: DatasetStore = app.state.dataset_store
+        replay_store: ReplaySetStore = app.state.replay_set_store
+        dataset_path = dataset_store.resolve_path(run.dataset_id)
+        if dataset_path is None:
+            raise HTTPException(status_code=404, detail=f"no such dataset: {run.dataset_id}")
+        dataset_rows = guided_dataset_rows(dataset_path)
+        failure_by_trace = {row["trace_id"]: row for row in derive_failures(run.capability_id)}
+        replay_rows: list[dict[str, Any]] = []
+        for index, row in enumerate(dataset_rows):
+            trace_id = str(row.get("trace_id") or f"{run.dataset_id}:row:{index}")
+            prompt = guided_row_prompt(row)
+            candidate_output = guided_row_completion(row)
+            failure = failure_by_trace.get(trace_id, {})
+            replay_rows.append(
+                {
+                    "trace_id": trace_id,
+                    "project_id": failure.get("project_id") or app.state.settings.default_project_id,
+                    "input": prompt,
+                    "context": failure.get("context") or "",
+                    "baseline_output": failure.get("output") or "",
+                    "candidate_output": candidate_output,
+                    "tags": {
+                        "phase": "3",
+                        "source": "guided-managed-replay",
+                        "dataset_id": run.dataset_id,
+                    },
+                }
+            )
+
+        name = f"Managed validation: {run.dataset_id}"
+        existing = next(
+            (item for item in replay_store.list_for_capability(run.capability_id) if item.name == name),
+            None,
+        )
+        now = _now_iso()
+        replay_set = existing or ReplaySet(
+            id=f"replay_{ULID()}",
+            capability_id=run.capability_id,
+            name=name,
+            rows=[],
+            created_at=now,
+            updated_at=now,
+        )
+        replay_set.rows = replay_rows
+        replay_set.updated_at = now
+        if not replay_set.created_at:
+            replay_set.created_at = now
+        replay_store.save(replay_set)
+        return replay_set
+
+    async def post_activation_check(capability_id: str, run: TrainingRun) -> dict[str, Any]:
+        validation = run.served_validation if isinstance(run.served_validation, dict) else {}
+        row = next(iter(validation.get("rows") or []), None)
+        prompt = str((row or {}).get("input") or "")
+        context = str((row or {}).get("context") or "")
+        if not prompt and run.dataset_path:
+            dataset_rows = guided_dataset_rows(run.dataset_path)
+            if dataset_rows:
+                prompt = guided_row_prompt(dataset_rows[0])
+        if not prompt:
+            return {"status": "failed", "proof_errors": ["missing validation prompt"]}
+
+        messages: list[ChatMessage] = []
+        if context:
+            messages.append(ChatMessage(role="system", content=context))
+        messages.append(ChatMessage(role="user", content=prompt))
+        request_body = ChatCompletionRequest(
+            model=str((run.artifact or {}).get("base_model") or ""),
+            messages=messages,
+            stream=False,
+        ).model_dump(exclude_none=True)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://flychain-internal"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json=request_body,
+                headers={
+                    "x-flychain-project": app.state.settings.default_project_id,
+                    "x-flychain-capabilities": capability_id,
+                    "x-flychain-tags": "phase=3,source=guided-post-activation",
+                },
+            )
+        response.raise_for_status()
+        payload = response.json()
+        adapter_run_id = response.headers.get("x-flychain-active-adapter-run-id", "")
+        adapter_capability_id = response.headers.get(
+            "x-flychain-active-adapter-capability-id", ""
+        )
+        routing_mode = response.headers.get("x-flychain-adapter-routing-mode", "")
+        trace_id = response.headers.get("x-flychain-trace-id", "")
+        proof_errors = []
+        if not trace_id:
+            proof_errors.append("missing trace id")
+        if adapter_run_id != run.id:
+            proof_errors.append("wrong adapter run id")
+        if adapter_capability_id != capability_id:
+            proof_errors.append("wrong adapter capability id")
+        if routing_mode != "active":
+            proof_errors.append("wrong adapter routing mode")
+        return {
+            "status": "failed" if proof_errors else "passed",
+            "trace_id": trace_id,
+            "provider": response.headers.get("x-flychain-provider", ""),
+            "model": response.headers.get("x-flychain-model", ""),
+            "adapter_run_id": adapter_run_id,
+            "adapter_capability_id": adapter_capability_id,
+            "routing_mode": routing_mode,
+            "proof_errors": proof_errors,
+            "output": _chat_output_text(payload),
+        }
+
+    def guided_action(
+        *,
+        action_type: str,
+        target_id: str,
+        status: str,
+        requires_approval: bool,
+        reason: str,
+        blocked_reasons: list[str] | None = None,
+        preview: dict[str, Any] | None = None,
+        default_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "id": guided_action_id(action_type, target_id),
+            "type": action_type,
+            "target_id": target_id,
+            "status": status,
+            "requires_approval": requires_approval,
+            "reason": reason,
+            "blocked_reasons": blocked_reasons or [],
+            "preview": preview or {},
+            "default_params": default_params or {},
+        }
+
+    def build_guided_actions(capability_id: str) -> dict[str, Any]:
+        capability_store: CapabilityStore = app.state.capability_store
+        cluster_store: ClusterStore = app.state.cluster_store
+        dataset_store: DatasetStore = app.state.dataset_store
+        run_store: TrainingRunStore = app.state.training_run_store
+        adapter_store: AdapterPointerStore = app.state.adapter_pointer_store
+        try:
+            spec = capability_store.get(capability_id)
+        except CapabilityNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"no such capability: {exc}") from exc
+
+        runtime = local_settings()
+        threshold = int(runtime.min_cluster_size)
+        clusters_data = cluster_store.load(capability_id) or {
+            "capability_id": capability_id,
+            "clusters": [],
+            "noise_trace_ids": [],
+        }
+        datasets = dataset_store.list_for_capability(capability_id)
+        runs = run_store.list_for_capability(capability_id)
+        active_adapter = adapter_store.get(capability_id)
+        active_run_id = active_adapter.get("active_run_id") if active_adapter else None
+        actions: list[dict[str, Any]] = []
+
+        for cluster_row in clusters_data.get("clusters", []):
+            cluster = Cluster(
+                id=cluster_row["id"],
+                capability_id=cluster_row["capability_id"],
+                label=cluster_row["label"],
+                size=cluster_row["size"],
+                trace_ids=list(cluster_row["trace_ids"]),
+            )
+            included, skipped = guided_cluster_failures(capability_id, cluster)
+            downstream = [dataset for dataset in datasets if dataset.get("cluster_id") == cluster.id]
+            blocked = []
+            if len(included) < threshold:
+                blocked.append(
+                    f"needs {threshold} corrected eligible failures; found {len(included)}"
+                )
+            status = "complete" if downstream else ("blocked" if blocked else "available")
+            actions.append(
+                guided_action(
+                    action_type="create_dataset",
+                    target_id=cluster.id,
+                    status=status,
+                    requires_approval=False,
+                    reason=(
+                        "Dataset already exists for this cluster"
+                        if downstream
+                        else "Create an SFT dataset from human corrections only"
+                    ),
+                    blocked_reasons=[] if downstream else blocked,
+                    preview={
+                        "cluster_id": cluster.id,
+                        "label": cluster.label,
+                        "method": "sft",
+                        "included_count": len(included),
+                        "included_trace_ids": [row["trace_id"] for row in included],
+                        "skipped_count": len(skipped),
+                        "skipped": skipped,
+                        "downstream_dataset_ids": [dataset["id"] for dataset in downstream],
+                    },
+                    default_params={"method": "sft", "generate_missing": False},
+                )
+            )
+
+        for dataset in datasets:
+            row_count = int(dataset.get("row_count") or 0)
+            related_runs = [run for run in runs if run.dataset_id == dataset.get("id")]
+            recipe = select_guided_recipe(spec, dataset)
+            correction_source = enrich_datasets(
+                [dataset],
+                runs=runs,
+                clusters=clusters_data.get("clusters", []),
+                failure_by_trace={row["trace_id"]: row for row in derive_failures(capability_id)},
+            )[0]["correction_source"]
+            blocked = []
+            if row_count < threshold:
+                blocked.append(f"needs at least {threshold} dataset rows; found {row_count}")
+            if int(correction_source.get("generated") or 0) > 0:
+                blocked.append("dataset includes generated corrections")
+            status = "complete" if related_runs else ("blocked" if blocked else "available")
+            actions.append(
+                guided_action(
+                    action_type="start_training",
+                    target_id=str(dataset["id"]),
+                    status=status,
+                    requires_approval=True,
+                    reason=(
+                        "Training run already exists for this dataset"
+                        if related_runs
+                        else "Queue one training run after inline approval"
+                    ),
+                    blocked_reasons=[] if related_runs else blocked,
+                    preview={
+                        "dataset_id": dataset["id"],
+                        "dataset_path": dataset.get("path"),
+                        "row_count": row_count,
+                        "recipe_id": recipe.id,
+                        "recipe_backend": recipe.backend.value,
+                        "recipe_method": recipe.method.value,
+                        "mlx_health": _http_health(
+                            "MLX server",
+                            app.state.settings.mlx_server_url,
+                            "/v1/models",
+                        ),
+                        "allow_backend_fallback": False,
+                        "downstream_run_ids": [run.id for run in related_runs],
+                    },
+                    default_params={
+                        "recipe_id": recipe.id,
+                        "allow_backend_fallback": False,
+                    },
+                )
+            )
+
+        for run in runs:
+            artifact = run.artifact or {}
+            validation = run.served_validation if isinstance(run.served_validation, dict) else {}
+            blocked = []
+            if run.status not in {"trained", "validation-failed"}:
+                blocked.append(f"run status is {run.status}")
+            if artifact.get("backend") != "mlx-lm" or bool(artifact.get("dry_run")):
+                blocked.append("run has no real MLX adapter artifact")
+            if not artifact.get("adapter_dir") or not artifact.get("base_model"):
+                blocked.append("run artifact is missing adapter metadata")
+            validation_status = str(validation.get("status") or "")
+            if validation_status == "passed":
+                status = "complete"
+            elif validation_status in {"queued", "running"} or run.status in {
+                "validation-queued",
+                "validation-running",
+            }:
+                status = "running"
+            else:
+                status = "blocked" if blocked else "available"
+            actions.append(
+                guided_action(
+                    action_type="run_served_validation",
+                    target_id=run.id,
+                    status=status,
+                    requires_approval=False,
+                    reason=(
+                        "Served validation already passed"
+                        if status == "complete"
+                        else "Run served validation through the real chat-serving path"
+                    ),
+                    blocked_reasons=[] if status in {"complete", "running"} else blocked,
+                    preview={
+                        "run_id": run.id,
+                        "dataset_id": run.dataset_id,
+                        "artifact_backend": artifact.get("backend"),
+                        "artifact_dry_run": bool(artifact.get("dry_run")),
+                        "served_validation_status": validation_status or None,
+                        "managed_replay_name": f"Managed validation: {run.dataset_id}",
+                    },
+                    default_params={"managed_replay": True},
+                )
+            )
+
+            promotion_blocked = []
+            if run.id == active_run_id:
+                promotion_status = "complete"
+            else:
+                if run.status not in {"validated", "promoted"}:
+                    promotion_blocked.append(f"run status is {run.status}")
+                if not run_requires_served_validation(run):
+                    promotion_blocked.append("run has no real served adapter artifact")
+                elif not run_has_served_validation(run):
+                    promotion_blocked.append(
+                        served_validation_error_detail(run)
+                        or "served validation has not passed"
+                    )
+                promotion_status = "blocked" if promotion_blocked else "available"
+            actions.append(
+                guided_action(
+                    action_type="promote_adapter",
+                    target_id=run.id,
+                    status=promotion_status,
+                    requires_approval=True,
+                    reason=(
+                        "Run is already active"
+                        if promotion_status == "complete"
+                        else "Promote this validated adapter after inline approval"
+                    ),
+                    blocked_reasons=[] if promotion_status == "complete" else promotion_blocked,
+                    preview={
+                        "current_active_adapter": active_adapter,
+                        "candidate_run_id": run.id,
+                        "validation_score": validation.get("aggregate_score"),
+                        "validation_status": validation.get("status"),
+                        "adapter_proof": {
+                            "adapter_run_id": validation.get("adapter_run_id"),
+                            "adapter_capability_id": validation.get("adapter_capability_id"),
+                            "routing_mode": validation.get("routing_mode"),
+                        },
+                    },
+                    default_params={"replace_active": True},
+                )
+            )
+
+        order = {
+            "create_dataset": 0,
+            "start_training": 1,
+            "run_served_validation": 2,
+            "promote_adapter": 3,
+        }
+        status_order = {"available": 0, "running": 1, "blocked": 2, "complete": 3}
+        actions.sort(
+            key=lambda action: (
+                order.get(str(action["type"]), 99),
+                status_order.get(str(action["status"]), 99),
+                str(action["target_id"]),
+            )
+        )
+        return {
+            "capability_id": capability_id,
+            "readiness": {
+                "min_cluster_size": threshold,
+                "active_adapter_run_id": active_run_id,
+            },
+            "thresholds": {"min_corrected_failures": threshold},
+            "active_adapter": {"capability_id": capability_id, "active": active_adapter},
+            "actions": actions,
+        }
+
+    def autopilot_policy(capability_id: str) -> AutopilotPolicy:
+        store: AutopilotStore = app.state.autopilot_store
+        return store.load_policy(capability_id, threshold=int(local_settings().min_cluster_size))
+
+    def autopilot_counts(
+        capability_id: str, *, policy: AutopilotPolicy | None = None
+    ) -> dict[str, int]:
+        cluster_store: ClusterStore = app.state.cluster_store
+        dataset_store: DatasetStore = app.state.dataset_store
+        run_store: TrainingRunStore = app.state.training_run_store
+        clusters = cluster_store.load(capability_id) or {"clusters": []}
+        failures = derive_failures(capability_id)
+
+        def is_dataset_eligible(row: dict[str, Any]) -> bool:
+            if row.get("correction_status") != "corrected":
+                return False
+            if row.get("review_status") == "not_useful":
+                return False
+            if row.get("correction_source") == "generated":
+                return bool(policy and policy.allow_generated_corrections)
+            return True
+
+        return {
+            "failures": len(failures),
+            "corrected_failures": len(
+                [row for row in failures if row.get("correction_status") == "corrected"]
+            ),
+            "eligible_failures": len([row for row in failures if is_dataset_eligible(row)]),
+            "clusters": len(clusters.get("clusters", [])),
+            "datasets": len(dataset_store.list_for_capability(capability_id)),
+            "training_runs": len(run_store.list_for_capability(capability_id)),
+        }
+
+    def autopilot_response(status: str, decision: dict[str, Any]) -> dict[str, Any]:
+        return {"status": status, "decision": decision}
+
+    def deterministic_expected_correction(
+        spec: CapabilitySpec, failure: dict[str, Any]
+    ) -> str | None:
+        failing = set(failure.get("failing_dimensions") or [])
+        for dimension in spec.eval_dimensions:
+            if dimension.id not in failing:
+                continue
+            evaluator = getattr(dimension, "evaluator", None)
+            deterministic = getattr(evaluator, "deterministic", None)
+            if str(getattr(evaluator, "mode", "")) != "EvaluatorMode.DETERMINISTIC" and str(
+                getattr(evaluator, "mode", "")
+            ) != "deterministic":
+                continue
+            if str(getattr(deterministic, "type", "")) not in {
+                "DeterministicEvaluatorType.EXACT_MATCH",
+                "exact_match",
+            }:
+                continue
+            expected = getattr(deterministic, "expected", None)
+            if isinstance(expected, str) and expected.strip():
+                return expected
+        return None
+
+    async def generate_autopilot_corrections(
+        capability_id: str,
+        *,
+        spec: CapabilitySpec,
+        policy: AutopilotPolicy,
+        trigger: str,
+    ) -> int:
+        trace_store: TraceStore = app.state.trace_store
+        generated = 0
+        for failure in derive_failures(capability_id):
+            if failure.get("correction_status") == "corrected":
+                continue
+            correction = deterministic_expected_correction(spec, failure)
+            if correction is None:
+                correction = str(failure.get("corrected_response") or "").strip()
+            if not correction:
+                continue
+            await trace_store.insert_feedback(
+                feedback_id=_new_id("fb"),
+                trace_id=str(failure["trace_id"]),
+                project_id=str(failure.get("project_id") or app.state.settings.default_project_id),
+                thumb="down",
+                score=-1,
+                comment="autopilot generated correction",
+                corrected_response=correction,
+                correction_source="generated",
+                correction_metadata={"policy_version": policy.version, "trigger": trigger},
+            )
+            generated += 1
+        return generated
+
+    def autopilot_cluster_failures(
+        capability_id: str, cluster: Cluster, policy: AutopilotPolicy
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        failure_by_trace = {row["trace_id"]: row for row in derive_failures(capability_id)}
+        included: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for trace_id in cluster.trace_ids:
+            failure = failure_by_trace.get(trace_id)
+            if failure is None:
+                skipped.append({"trace_id": trace_id, "reason": "missing_failure_evidence"})
+                continue
+            if failure.get("review_status") == "not_useful":
+                skipped.append({"trace_id": trace_id, "reason": "not_useful"})
+                continue
+            if failure.get("correction_status") != "corrected":
+                skipped.append({"trace_id": trace_id, "reason": "missing_correction"})
+                continue
+            if failure.get("correction_source") == "generated" and not policy.allow_generated_corrections:
+                skipped.append(
+                    {"trace_id": trace_id, "reason": "generated_correction_not_allowed"}
+                )
+                continue
+            included.append(failure)
+        return included, skipped
+
+    async def autopilot_cluster_if_needed(
+        capability_id: str,
+        *,
+        spec: CapabilitySpec,
+        policy: AutopilotPolicy,
+        trigger: str,
+    ) -> None:
+        cluster_store: ClusterStore = app.state.cluster_store
+        existing = cluster_store.load(capability_id) or {}
+        if existing.get("clusters"):
+            return
+        failures = [failed_trace_from_row(row) for row in derive_failures(capability_id)]
+        if len(failures) < int(policy.min_cluster_size):
+            return
+        runtime = local_settings()
+        result = await cluster_failures(
+            capability=spec,
+            failures=failures,
+            embedder=auto_embedder(ollama_model=runtime.embedding_model),
+            llm=judge_client(runtime),
+            min_cluster_size=int(policy.min_cluster_size),
+            summarize=True,
+        )
+        cluster_store.save(result)
+        store: AutopilotStore = app.state.autopilot_store
+        store.append_decision(
+            capability_id,
+            trigger=trigger,
+            policy_version=policy.version,
+            action="cluster_failures",
+            outcome="complete",
+            input_counts=autopilot_counts(capability_id, policy=policy),
+            result={"cluster_count": len(result.clusters)},
+        )
+
+    def training_runs_today(capability_id: str) -> int:
+        today = _now_iso()[:10]
+        run_store: TrainingRunStore = app.state.training_run_store
+        return len(
+            [
+                run
+                for run in run_store.list_for_capability(capability_id)
+                if str(run.created_at).startswith(today)
+            ]
+        )
+
+    def promotion_cooldown_remaining(capability_id: str, policy: AutopilotPolicy) -> int:
+        cooldown = int(policy.promotion_cooldown_seconds or 0)
+        if cooldown <= 0:
+            return 0
+        from datetime import UTC, datetime
+
+        store: AutopilotStore = app.state.autopilot_store
+        now = datetime.now(UTC)
+        for row in store.list_audit(capability_id, limit=500):
+            if row.get("action") != "promote_adapter" or row.get("outcome") != "complete":
+                continue
+            ts = str(row.get("approved_at") or row.get("updated_at") or row.get("created_at") or "")
+            try:
+                promoted_at = datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+            if promoted_at.tzinfo is None:
+                promoted_at = promoted_at.replace(tzinfo=UTC)
+            remaining = cooldown - int((now - promoted_at).total_seconds())
+            if remaining > 0:
+                return remaining
+        return 0
+
+    async def autopilot_create_dataset_for_cluster(
+        capability_id: str,
+        *,
+        spec: CapabilitySpec,
+        cluster: Cluster,
+        policy: AutopilotPolicy,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        dataset_store: DatasetStore = app.state.dataset_store
+        included, skipped = autopilot_cluster_failures(capability_id, cluster, policy)
+        included_trace_ids = [row["trace_id"] for row in included]
+        cluster_for_dataset = Cluster(
+            id=cluster.id,
+            capability_id=cluster.capability_id,
+            label=cluster.label,
+            size=len(included_trace_ids),
+            trace_ids=included_trace_ids,
+        )
+        rows = await synthesize_sft_dataset(
+            capability=spec,
+            cluster=cluster_for_dataset,
+            failures=[failed_trace_from_row(row) for row in included],
+            llm=None,
+            generate_missing=False,
+        )
+        dataset_id = f"ds_{ULID()}"
+        out_dir = default_data_dir() / "datasets" / capability_id
+        out_path = out_dir / f"{dataset_id}.jsonl"
+        write_jsonl(out_path, rows)
+        record = SynthesizedDataset(
+            id=dataset_id,
+            capability_id=capability_id,
+            cluster_id=cluster.id,
+            method="sft",
+            path=str(out_path),
+            row_count=len(rows),
+        )
+        dataset_store.record(record)
+        return asdict(record), skipped
+
+    def promote_run_for_autopilot(
+        capability_id: str,
+        run: TrainingRun,
+        *,
+        reason: str,
+        decision_id: str | None,
+    ) -> dict[str, Any]:
+        adapter_store: AdapterPointerStore = app.state.adapter_pointer_store
+        autopilot_store: AutopilotStore = app.state.autopilot_store
+        run_store: TrainingRunStore = app.state.training_run_store
+        previous = adapter_store.get(capability_id)
+        adapter_store.set_active(
+            capability_id,
+            run_id=run.id,
+            adapter_dir=str((run.artifact or {}).get("adapter_dir", "")),
+            baseline=run.baseline,
+            candidate=run.candidate,
+        )
+        current = adapter_store.get(capability_id)
+        autopilot_store.record_adapter_history(
+            capability_id,
+            previous=previous,
+            current=current,
+            reason=reason,
+            decision_id=decision_id,
+        )
+        run.status = "promoted"
+        run.updated_at = _now_iso()
+        run_store.save(run)
+        return {"capability_id": capability_id, "active_run_id": run.id}
+
+    async def run_autopilot(capability_id: str, *, trigger: str) -> dict[str, Any]:
+        capability_store: CapabilityStore = app.state.capability_store
+        autopilot_store: AutopilotStore = app.state.autopilot_store
+        cluster_store: ClusterStore = app.state.cluster_store
+        dataset_store: DatasetStore = app.state.dataset_store
+        run_store: TrainingRunStore = app.state.training_run_store
+        adapter_store: AdapterPointerStore = app.state.adapter_pointer_store
+        try:
+            spec = capability_store.get(capability_id)
+        except CapabilityNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"no such capability: {exc}") from exc
+
+        policy = autopilot_policy(capability_id)
+        if not policy.enabled:
+            decision = autopilot_store.append_decision(
+                capability_id,
+                trigger=trigger,
+                policy_version=policy.version,
+                action="none",
+                outcome="skipped",
+                reasons=["policy disabled"],
+                input_counts=autopilot_counts(capability_id, policy=policy),
+            )
+            return autopilot_response("skipped", decision.as_dict())
+
+        if policy.auto_generate_corrections:
+            generated = await generate_autopilot_corrections(
+                capability_id, spec=spec, policy=policy, trigger=trigger
+            )
+            if generated:
+                autopilot_store.append_decision(
+                    capability_id,
+                    trigger=trigger,
+                    policy_version=policy.version,
+                    action="generate_corrections",
+                    outcome="complete",
+                    input_counts=autopilot_counts(capability_id, policy=policy),
+                    result={"generated": generated},
+                )
+
+        await autopilot_cluster_if_needed(
+            capability_id, spec=spec, policy=policy, trigger=trigger
+        )
+
+        clusters_data = cluster_store.load(capability_id) or {
+            "capability_id": capability_id,
+            "clusters": [],
+        }
+        datasets = dataset_store.list_for_capability(capability_id)
+        runs = run_store.list_for_capability(capability_id)
+        active = adapter_store.get(capability_id)
+        active_run_id = active.get("active_run_id") if active else None
+
+        for cluster_row in clusters_data.get("clusters", []):
+            cluster = Cluster(
+                id=cluster_row["id"],
+                capability_id=cluster_row["capability_id"],
+                label=cluster_row["label"],
+                size=cluster_row["size"],
+                trace_ids=list(cluster_row["trace_ids"]),
+            )
+            if any(dataset.get("cluster_id") == cluster.id for dataset in datasets):
+                continue
+            included, skipped = autopilot_cluster_failures(capability_id, cluster, policy)
+            reasons = []
+            if len(included) < int(policy.min_corrected_failures):
+                reasons.append(
+                    f"needs {policy.min_corrected_failures} corrected eligible failures; found {len(included)}"
+                )
+            if skipped and all(row["reason"] == "generated_correction_not_allowed" for row in skipped):
+                reasons.append("generated corrections are not dataset eligible")
+            if not policy.auto_create_dataset:
+                reasons.append("auto dataset creation disabled")
+            if reasons:
+                decision = autopilot_store.append_decision(
+                    capability_id,
+                    trigger=trigger,
+                    policy_version=policy.version,
+                    action="create_dataset",
+                    outcome="blocked",
+                    reasons=reasons,
+                    input_counts=autopilot_counts(capability_id, policy=policy),
+                    target_id=cluster.id,
+                    result={"skipped": skipped},
+                )
+                return autopilot_response("blocked", decision.as_dict())
+            dataset, skipped = await autopilot_create_dataset_for_cluster(
+                capability_id, spec=spec, cluster=cluster, policy=policy
+            )
+            decision = autopilot_store.append_decision(
+                capability_id,
+                trigger=trigger,
+                policy_version=policy.version,
+                action="create_dataset",
+                outcome="complete",
+                input_counts=autopilot_counts(capability_id, policy=policy),
+                target_id=cluster.id,
+                result={
+                    "dataset_id": dataset["id"],
+                    "row_count": dataset["row_count"],
+                    "skipped": skipped,
+                },
+            )
+            datasets = dataset_store.list_for_capability(capability_id)
+            runs = run_store.list_for_capability(capability_id)
+
+        for dataset in datasets:
+            related_runs = [run for run in runs if run.dataset_id == dataset.get("id")]
+            if related_runs:
+                continue
+            reasons = []
+            if not policy.auto_start_training:
+                reasons.append("auto training disabled")
+            if int(dataset.get("row_count") or 0) < int(policy.min_corrected_failures):
+                reasons.append(
+                    f"needs at least {policy.min_corrected_failures} dataset rows; found {int(dataset.get('row_count') or 0)}"
+                )
+            if training_runs_today(capability_id) >= int(policy.max_training_runs_per_day):
+                reasons.append("training rate limit reached")
+            recipe = select_guided_recipe(spec, dataset)
+            if recipe.id not in set(policy.allowed_training_recipes):
+                reasons.append(f"recipe not allowed by policy: {recipe.id}")
+            if reasons:
+                decision = autopilot_store.append_decision(
+                    capability_id,
+                    trigger=trigger,
+                    policy_version=policy.version,
+                    action="start_training",
+                    outcome="blocked",
+                    reasons=reasons,
+                    input_counts=autopilot_counts(capability_id, policy=policy),
+                    target_id=str(dataset["id"]),
+                )
+                return autopilot_response("blocked", decision.as_dict())
+            run = await queue_training_run(
+                CreateTrainingRun(
+                    capability_id=capability_id,
+                    recipe_id=recipe.id,
+                    dataset_id=str(dataset["id"]),
+                    allow_backend_fallback=bool(policy.allow_dry_run_fallback),
+                )
+            )
+            job_ids = [
+                job.id
+                for job in app.state.job_store.list()
+                if job.run_id == run.id and job.type == "training"
+            ][:1]
+            decision = autopilot_store.append_decision(
+                capability_id,
+                trigger=trigger,
+                policy_version=policy.version,
+                action="start_training",
+                outcome="running",
+                input_counts=autopilot_counts(capability_id, policy=policy),
+                target_id=run.id,
+                job_ids=job_ids,
+                result={"run_id": run.id, "dataset_id": run.dataset_id},
+            )
+            return autopilot_response("running", decision.as_dict())
+
+        for run in runs:
+            validation = run.served_validation if isinstance(run.served_validation, dict) else {}
+            if validation.get("status") in {"passed", "queued", "running"}:
+                continue
+            if run.status not in {"trained", "validation-failed"}:
+                continue
+            reasons = []
+            if not policy.auto_run_served_validation:
+                reasons.append("auto served validation disabled")
+            artifact = run.artifact or {}
+            if artifact.get("backend") != "mlx-lm" or bool(artifact.get("dry_run")):
+                reasons.append("run has no real MLX adapter artifact")
+            if reasons:
+                decision = autopilot_store.append_decision(
+                    capability_id,
+                    trigger=trigger,
+                    policy_version=policy.version,
+                    action="run_served_validation",
+                    outcome="blocked",
+                    reasons=reasons,
+                    input_counts=autopilot_counts(capability_id, policy=policy),
+                    target_id=run.id,
+                )
+                return autopilot_response("blocked", decision.as_dict())
+            replay_set = managed_replay_set_for_run(run)
+            queued = await queue_served_validation(run.id, replay_set.id)
+            validation = queued.served_validation or {}
+            decision = autopilot_store.append_decision(
+                capability_id,
+                trigger=trigger,
+                policy_version=policy.version,
+                action="run_served_validation",
+                outcome="running",
+                input_counts=autopilot_counts(capability_id, policy=policy),
+                target_id=run.id,
+                job_ids=[str(validation.get("job_id"))] if validation.get("job_id") else [],
+                result={"run_id": run.id, "replay_set_id": replay_set.id},
+            )
+            return autopilot_response("running", decision.as_dict())
+
+        for run in runs:
+            if run.id == active_run_id:
+                continue
+            if run.status not in {"validated", "promoted"}:
+                continue
+            reasons = []
+            if policy.require_served_validation and not run_has_served_validation(run):
+                reasons.append(
+                    served_validation_error_detail(run) or "served validation has not passed"
+                )
+            cooldown_remaining = promotion_cooldown_remaining(capability_id, policy)
+            if cooldown_remaining > 0:
+                reasons.append(f"promotion cooldown active for {cooldown_remaining}s")
+            if reasons:
+                decision = autopilot_store.append_decision(
+                    capability_id,
+                    trigger=trigger,
+                    policy_version=policy.version,
+                    action="promote_adapter",
+                    outcome="blocked",
+                    reasons=reasons,
+                    input_counts=autopilot_counts(capability_id, policy=policy),
+                    target_id=run.id,
+                )
+                return autopilot_response("blocked", decision.as_dict())
+            if policy.require_promotion_approval or not policy.auto_promote:
+                decision = autopilot_store.append_decision(
+                    capability_id,
+                    trigger=trigger,
+                    policy_version=policy.version,
+                    action="promote_adapter",
+                    outcome="approval_required",
+                    reasons=["promotion approval required"],
+                    input_counts=autopilot_counts(capability_id, policy=policy),
+                    target_id=run.id,
+                    approval_status="pending",
+                    result={
+                        "candidate_run_id": run.id,
+                        "validation": run.served_validation or {},
+                        "current_active_adapter": active,
+                    },
+                )
+                return autopilot_response("approval_required", decision.as_dict())
+            result = promote_run_for_autopilot(
+                capability_id, run, reason="autopilot auto-promote", decision_id=None
+            )
+            decision = autopilot_store.append_decision(
+                capability_id,
+                trigger=trigger,
+                policy_version=policy.version,
+                action="promote_adapter",
+                outcome="complete",
+                input_counts=autopilot_counts(capability_id, policy=policy),
+                target_id=run.id,
+                result=result,
+            )
+            return autopilot_response("complete", decision.as_dict())
+
+        decision = autopilot_store.append_decision(
+            capability_id,
+            trigger=trigger,
+            policy_version=policy.version,
+            action="none",
+            outcome="complete",
+            input_counts=autopilot_counts(capability_id, policy=policy),
+            reasons=["no autopilot action available"],
+        )
+        return autopilot_response("complete", decision.as_dict())
+
+    async def maybe_run_enabled_autopilot(
+        capability_ids: list[str] | set[str], *, trigger: str
+    ) -> dict[str, Any]:
+        results: dict[str, Any] = {}
+        for capability_id in sorted({str(item) for item in capability_ids if str(item).strip()}):
+            try:
+                if not autopilot_policy(capability_id).enabled:
+                    continue
+                results[capability_id] = await run_autopilot(capability_id, trigger=trigger)
+            except Exception as exc:  # pragma: no cover - defensive trigger isolation
+                logger.warning("autopilot trigger %s failed for %s: %s", trigger, capability_id, exc)
+        return results
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -1078,7 +2548,18 @@ def create_app() -> FastAPI:
             score=score,
             comment=payload.comment or "",
             corrected_response=payload.corrected_response or "",
+            correction_source="human",
         )
+        if payload.corrected_response:
+            trace_rows = [row for row in list_all_traces() if row["trace_id"] == payload.trace_id]
+            capability_ids: set[str] = set()
+            for row in trace_rows:
+                capability_ids.update(str(item) for item in row.get("capability_ids", []) or [])
+            capability_ids.update(
+                str(row["capability_id"])
+                for row in store.list_eval_scores(trace_id=payload.trace_id)
+            )
+            await maybe_run_enabled_autopilot(capability_ids, trigger="correction_added")
         return FeedbackAccepted(feedback_id=feedback_id, trace_id=payload.trace_id)
 
     @app.get("/v1/capabilities/templates")
@@ -1230,9 +2711,13 @@ def create_app() -> FastAPI:
         if all_scores:
             await trace_store.insert_eval_scores([s.as_dict() for s in all_scores])
 
+        failed_capability_ids = {score.capability_id for score in all_scores if not score.passed}
         auto_clusters = await maybe_auto_cluster_failures(
             specs=specs,
-            failed_capability_ids={score.capability_id for score in all_scores if not score.passed},
+            failed_capability_ids=failed_capability_ids,
+        )
+        autopilot = await maybe_run_enabled_autopilot(
+            failed_capability_ids, trigger="eval_persisted"
         )
 
         return {
@@ -1240,6 +2725,7 @@ def create_app() -> FastAPI:
             "evaluated_capabilities": list(per_capability.keys()),
             "per_capability": per_capability,
             "auto_clusters": auto_clusters,
+            "autopilot": autopilot,
         }
 
     @app.get("/debug/traces")
@@ -1277,6 +2763,10 @@ def create_app() -> FastAPI:
             offset=offset,
         )
         return {"traces": traces, "total": total, "limit": limit, "offset": offset}
+
+    @app.get("/v1/traces/{trace_id}/evals")
+    def trace_evals(trace_id: str, capability_id: str | None = None) -> dict[str, Any]:
+        return eval_score_summary(trace_id=trace_id, capability_id=capability_id)
 
     @app.get("/v1/jobs")
     def jobs_list(limit: int = 100) -> dict[str, Any]:
@@ -1336,6 +2826,7 @@ def create_app() -> FastAPI:
                 "postgres_url": settings.postgres_url,
                 "redis_url": settings.redis_url,
                 "data_dir": str(default_data_dir()),
+                "health": _runtime_health(app, settings),
             },
         }
 
@@ -1348,6 +2839,16 @@ def create_app() -> FastAPI:
             "settings": settings.model_dump(mode="json"),
             "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
             "anthropic_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
+            "runtime": {
+                "env": app.state.settings.env,
+                "ollama_url": app.state.settings.ollama_url,
+                "mlx_server_url": app.state.settings.mlx_server_url,
+                "clickhouse_url": app.state.settings.clickhouse_url,
+                "postgres_url": app.state.settings.postgres_url,
+                "redis_url": app.state.settings.redis_url,
+                "data_dir": str(default_data_dir()),
+                "health": _runtime_health(app, app.state.settings),
+            },
         }
 
     @app.get("/v1/capabilities/{capability_id}/failures")
@@ -1355,6 +2856,565 @@ def create_app() -> FastAPI:
         return {
             "capability_id": capability_id,
             "failures": derive_failures(capability_id),
+        }
+
+    @app.post("/v1/capabilities/{capability_id}/failures/{trace_id}/review")
+    def capabilities_failure_review(
+        capability_id: str,
+        trace_id: str,
+        body: FailureReviewRequest,
+    ) -> dict[str, Any]:
+        capability_store: CapabilityStore = app.state.capability_store
+        if not capability_store.exists(capability_id):
+            raise HTTPException(status_code=404, detail="no such capability")
+        failure_ids = {row["trace_id"] for row in derive_failures(capability_id)}
+        if trace_id not in failure_ids:
+            raise HTTPException(status_code=404, detail=f"no such failure: {trace_id}")
+        review_store: FailureReviewStore = app.state.failure_review_store
+        review = review_store.save(
+            capability_id=capability_id,
+            trace_id=trace_id,
+            status=body.status,
+            note=body.note or "",
+            updated_at=_now_iso(),
+        )
+        return review.as_dict()
+
+    @app.get("/v1/capabilities/{capability_id}/flywheel")
+    def capability_flywheel(capability_id: str) -> dict[str, Any]:
+        capability_store: CapabilityStore = app.state.capability_store
+        cluster_store: ClusterStore = app.state.cluster_store
+        dataset_store: DatasetStore = app.state.dataset_store
+        run_store: TrainingRunStore = app.state.training_run_store
+        adapter_store: AdapterPointerStore = app.state.adapter_pointer_store
+        job_store: JobStore = app.state.job_store
+        trace_store: TraceStore = app.state.trace_store
+
+        try:
+            spec = capability_store.get(capability_id)
+        except CapabilityNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"no such capability: {exc}") from exc
+
+        eval_rows = trace_store.list_eval_scores(capability_id=capability_id)
+        eval_trace_ids = {row["trace_id"] for row in eval_rows}
+        all_traces = list_all_traces()
+        traces = [
+            row
+            for row in all_traces
+            if capability_id in (row.get("capability_ids") or [])
+            or row["trace_id"] in eval_trace_ids
+        ]
+        traces.sort(key=lambda row: row.get("ts", ""), reverse=True)
+
+        failures = derive_failures(capability_id)
+        failure_by_trace = {row["trace_id"]: row for row in failures}
+        clusters_data = cluster_store.load(capability_id) or {
+            "capability_id": capability_id,
+            "clusters": [],
+            "noise_trace_ids": [],
+        }
+        datasets = dataset_store.list_for_capability(capability_id)
+        runs = run_store.list_for_capability(capability_id)
+        run_ids = {run.id for run in runs}
+        active_adapter = adapter_store.get(capability_id)
+        active_run_id = active_adapter.get("active_run_id") if active_adapter else None
+        jobs = [
+            job.as_dict()
+            for job in job_store.list(limit=200)
+            if job.capability_id == capability_id or job.run_id in run_ids
+        ]
+
+        cluster_rows = enrich_clusters(
+            clusters_data.get("clusters", []),
+            datasets=datasets,
+            failure_by_trace=failure_by_trace,
+        )
+        dataset_rows = enrich_datasets(
+            datasets,
+            runs=runs,
+            clusters=clusters_data.get("clusters", []),
+            failure_by_trace=failure_by_trace,
+        )
+        run_rows = [
+            enrich_training_run(run, active_run_id=active_run_id)
+            for run in sorted(runs, key=lambda item: item.updated_at, reverse=True)
+        ]
+        latest_validation = latest_served_validation(runs)
+        last_adapted = last_adapted_chat(traces)
+        before_after = latest_before_after(runs, active_run_id=active_run_id)
+
+        unresolved_failures = [
+            failure
+            for failure in failures
+            if failure["correction_status"] != "corrected"
+            and failure["review_status"] != "not_useful"
+        ]
+        corrected_failures = [
+            failure for failure in failures if failure["correction_status"] == "corrected"
+        ]
+        promoted_runs = [run for run in runs if run.status == "promoted"]
+        served_count = 1 if last_adapted else 0
+
+        summary = {
+            "total_traces": len({row["trace_id"] for row in traces}),
+            "evaluated_traces": len(eval_trace_ids),
+            "failing_traces": len(failures),
+            "unresolved_failures": len(unresolved_failures),
+            "clusters": len(cluster_rows),
+            "datasets": len(dataset_rows),
+            "training_runs": len(runs),
+            "latest_served_validation": latest_validation,
+            "active_adapter": active_adapter,
+            "last_adapted_chat": last_adapted,
+        }
+        timeline = [
+            timeline_step("capture", "Capture traces", len(traces), traces, "#traces"),
+            timeline_step("evaluate", "Evaluate", len(eval_trace_ids), eval_rows, "#traces"),
+            timeline_step("fail", "Detect failures", len(failures), failures, "#failures"),
+            timeline_step(
+                "correct",
+                "Collect corrections",
+                len(corrected_failures),
+                corrected_failures,
+                "#failures",
+            ),
+            timeline_step("cluster", "Cluster", len(cluster_rows), cluster_rows, "#clusters"),
+            timeline_step(
+                "dataset",
+                "Synthesize dataset",
+                len(dataset_rows),
+                dataset_rows,
+                "#datasets",
+            ),
+            timeline_step("train", "Train", len(runs), run_rows, "#runs"),
+            timeline_step(
+                "validate",
+                "Validate served adapter",
+                1 if latest_validation else 0,
+                [latest_validation] if latest_validation else [],
+                "#runs",
+            ),
+            timeline_step("promote", "Promote", len(promoted_runs), run_rows, "#runs"),
+            timeline_step("serve", "Serve active adapter", served_count, traces, "#before-after"),
+        ]
+
+        return {
+            "capability": spec.model_dump(mode="json"),
+            "capability_id": capability_id,
+            "summary": summary,
+            "timeline": timeline,
+            "traces": traces,
+            "failures": failures,
+            "clusters": cluster_rows,
+            "datasets": dataset_rows,
+            "training_runs": run_rows,
+            "jobs": jobs,
+            "active_adapter": {"capability_id": capability_id, "active": active_adapter},
+            "before_after": before_after,
+        }
+
+    @app.get("/v1/capabilities/{capability_id}/guided-actions")
+    def capability_guided_actions(capability_id: str) -> dict[str, Any]:
+        return build_guided_actions(capability_id)
+
+    @app.post("/v1/capabilities/{capability_id}/guided-actions/{action_id:path}/execute")
+    async def capability_guided_action_execute(
+        capability_id: str,
+        action_id: str,
+        body: GuidedActionExecuteRequest,
+    ) -> dict[str, Any]:
+        action_type, target_id = parse_guided_action_id(action_id)
+        actions_body = build_guided_actions(capability_id)
+        action = next(
+            (item for item in actions_body["actions"] if item["id"] == action_id),
+            None,
+        )
+        if action is None:
+            raise HTTPException(status_code=404, detail=f"no such guided action: {action_id}")
+        if action["status"] != "available":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": f"guided action is {action['status']}",
+                    "blocked_reasons": action.get("blocked_reasons", []),
+                },
+            )
+        if action.get("requires_approval") and not body.approved:
+            raise HTTPException(
+                status_code=409,
+                detail="explicit approval is required for this guided action",
+            )
+
+        if action_type == "create_dataset":
+            capability_store: CapabilityStore = app.state.capability_store
+            dataset_store: DatasetStore = app.state.dataset_store
+            try:
+                spec = capability_store.get(capability_id)
+            except CapabilityNotFoundError as exc:
+                raise HTTPException(
+                    status_code=404, detail=f"no such capability: {exc}"
+                ) from exc
+            cluster = resolve_cluster(capability_id, target_id)
+            included, skipped = guided_cluster_failures(capability_id, cluster)
+            included_trace_ids = [row["trace_id"] for row in included]
+            cluster_for_dataset = Cluster(
+                id=cluster.id,
+                capability_id=cluster.capability_id,
+                label=cluster.label,
+                size=len(included_trace_ids),
+                trace_ids=included_trace_ids,
+            )
+            failures = [failed_trace_from_row(row) for row in included]
+            job = create_job(
+                job_type="dataset_synthesis",
+                capability_id=capability_id,
+                trace_ids=included_trace_ids,
+                cluster_id=cluster.id,
+                max_retries=1,
+            )
+            started_job = app.state.job_store.start(job.id) or job
+            try:
+                rows = await wait_for_job_timeout(
+                    started_job,
+                    synthesize_sft_dataset(
+                        capability=spec,
+                        cluster=cluster_for_dataset,
+                        failures=failures,
+                        llm=None,
+                        generate_missing=False,
+                    ),
+                )
+                dataset_id = f"ds_{ULID()}"
+                out_dir = default_data_dir() / "datasets" / capability_id
+                out_path = out_dir / f"{dataset_id}.jsonl"
+                write_jsonl(out_path, rows)
+                record = SynthesizedDataset(
+                    id=dataset_id,
+                    capability_id=capability_id,
+                    cluster_id=cluster.id,
+                    method="sft",
+                    path=str(out_path),
+                    row_count=len(rows),
+                )
+                dataset_store.record(record)
+                started_job.dataset_id = record.id
+                app.state.job_store.save(started_job)
+                app.state.job_store.succeed(job.id)
+                return {
+                    "capability_id": capability_id,
+                    "action": action,
+                    "result": {
+                        "dataset_id": record.id,
+                        "cluster_id": cluster.id,
+                        "method": record.method,
+                        "path": record.path,
+                        "row_count": record.row_count,
+                        "included_trace_ids": included_trace_ids,
+                        "skipped": skipped,
+                        "job_id": job.id,
+                    },
+                }
+            except TimeoutError as exc:
+                app.state.job_store.timeout(
+                    job.id,
+                    error=f"dataset synthesis job timed out after {started_job.timeout_seconds}s",
+                )
+                raise HTTPException(
+                    status_code=504, detail="dataset synthesis job timed out"
+                ) from exc
+            except Exception as exc:
+                app.state.job_store.fail(job.id, error=str(exc))
+                raise
+
+        if action_type == "start_training":
+            preview = dict(action.get("preview") or {})
+            run = await queue_training_run(
+                CreateTrainingRun(
+                    capability_id=capability_id,
+                    recipe_id=str(preview.get("recipe_id") or ""),
+                    dataset_id=target_id,
+                    allow_backend_fallback=False,
+                )
+            )
+            return {
+                "capability_id": capability_id,
+                "action": action,
+                "result": {
+                    "run_id": run.id,
+                    "status": run.status,
+                    "dataset_id": run.dataset_id,
+                    "recipe_id": run.recipe_id,
+                    "allow_backend_fallback": run.allow_backend_fallback,
+                },
+            }
+
+        if action_type == "run_served_validation":
+            validation_run_store: TrainingRunStore = app.state.training_run_store
+            validation_run = validation_run_store.load(target_id)
+            if validation_run is None or validation_run.capability_id != capability_id:
+                raise HTTPException(status_code=404, detail=f"no such run: {target_id}")
+            resolve_run_mlx_adapter(validation_run)
+            replay_set = managed_replay_set_for_run(validation_run)
+            queued = await queue_served_validation(validation_run.id, replay_set.id)
+            validation = queued.served_validation or {}
+            return {
+                "capability_id": capability_id,
+                "action": action,
+                "result": {
+                    "run_id": queued.id,
+                    "status": queued.status,
+                    "replay_set_id": replay_set.id,
+                    "job_id": validation.get("job_id"),
+                    "managed_replay_name": replay_set.name,
+                    "row_count": len(replay_set.rows),
+                },
+            }
+
+        if action_type == "promote_adapter":
+            promotion_run_store: TrainingRunStore = app.state.training_run_store
+            adapter_store: AdapterPointerStore = app.state.adapter_pointer_store
+            autopilot_store: AutopilotStore = app.state.autopilot_store
+            promotion_run = promotion_run_store.load(target_id)
+            if promotion_run is None:
+                raise HTTPException(status_code=404, detail=f"no such run: {target_id}")
+            if promotion_run.capability_id != capability_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"run {target_id} belongs to capability {promotion_run.capability_id}",
+                )
+            if promotion_run.status not in {"validated", "promoted"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"run not in promotable state: {promotion_run.status}",
+                )
+            if promotion_run.artifact is None:
+                raise HTTPException(status_code=409, detail="run has no artifact")
+            if not run_requires_served_validation(promotion_run):
+                raise HTTPException(
+                    status_code=409,
+                    detail="run has no real served adapter artifact",
+                )
+            if not run_has_served_validation(promotion_run):
+                raise HTTPException(
+                    status_code=409,
+                    detail=served_validation_error_detail(promotion_run)
+                    or "run cannot be promoted until served validation passes",
+                )
+            previous = adapter_store.get(capability_id)
+            adapter_store.set_active(
+                capability_id,
+                run_id=promotion_run.id,
+                adapter_dir=str(promotion_run.artifact.get("adapter_dir", "")),
+                baseline=promotion_run.baseline,
+                candidate=promotion_run.candidate,
+            )
+            autopilot_store.record_adapter_history(
+                capability_id,
+                previous=previous,
+                current=adapter_store.get(capability_id),
+                reason="guided promotion",
+            )
+            promotion_run.status = "promoted"
+            promotion_run.updated_at = _now_iso()
+            promotion_run_store.save(promotion_run)
+            proof = await post_activation_check(capability_id, promotion_run)
+            return {
+                "capability_id": capability_id,
+                "action": action,
+                "result": {
+                    "active_run_id": promotion_run.id,
+                    "post_activation_check": proof,
+                },
+            }
+
+        raise HTTPException(status_code=400, detail=f"unsupported guided action: {action_type}")
+
+    @app.get("/v1/capabilities/{capability_id}/autopilot-policy")
+    def capability_autopilot_policy(capability_id: str) -> dict[str, Any]:
+        capability_store: CapabilityStore = app.state.capability_store
+        if not capability_store.exists(capability_id):
+            raise HTTPException(status_code=404, detail="no such capability")
+        policy = autopilot_policy(capability_id)
+        return {"capability_id": capability_id, "policy": policy.as_dict()}
+
+    @app.put("/v1/capabilities/{capability_id}/autopilot-policy")
+    def capability_autopilot_policy_update(
+        capability_id: str, body: AutopilotPolicyUpdate
+    ) -> dict[str, Any]:
+        capability_store: CapabilityStore = app.state.capability_store
+        if not capability_store.exists(capability_id):
+            raise HTTPException(status_code=404, detail="no such capability")
+        store: AutopilotStore = app.state.autopilot_store
+        policy = store.save_policy(
+            capability_id,
+            threshold=int(local_settings().min_cluster_size),
+            patch=body.model_dump(exclude_none=True),
+        )
+        return {"capability_id": capability_id, "policy": policy.as_dict()}
+
+    @app.get("/v1/capabilities/{capability_id}/autopilot/audit")
+    def capability_autopilot_audit(capability_id: str) -> dict[str, Any]:
+        capability_store: CapabilityStore = app.state.capability_store
+        if not capability_store.exists(capability_id):
+            raise HTTPException(status_code=404, detail="no such capability")
+        store: AutopilotStore = app.state.autopilot_store
+        return {"capability_id": capability_id, "audit": store.list_audit(capability_id)}
+
+    @app.get("/v1/capabilities/{capability_id}/autopilot")
+    def capability_autopilot_status(capability_id: str) -> dict[str, Any]:
+        capability_store: CapabilityStore = app.state.capability_store
+        if not capability_store.exists(capability_id):
+            raise HTTPException(status_code=404, detail="no such capability")
+        store: AutopilotStore = app.state.autopilot_store
+        policy = autopilot_policy(capability_id)
+        audit = store.list_audit(capability_id)
+        pending = next(
+            (
+                row
+                for row in audit
+                if row.get("approval_status") == "pending"
+                and row.get("outcome") == "approval_required"
+            ),
+            None,
+        )
+        return {
+            "capability_id": capability_id,
+            "policy": policy.as_dict(),
+            "readiness": autopilot_counts(capability_id, policy=policy),
+            "latest_decision": audit[0] if audit else None,
+            "pending_approval": pending,
+            "audit": audit,
+        }
+
+    @app.post("/v1/capabilities/{capability_id}/autopilot/run")
+    async def capability_autopilot_run(
+        capability_id: str, body: AutopilotRunRequest
+    ) -> dict[str, Any]:
+        return await run_autopilot(capability_id, trigger=body.trigger or "manual")
+
+    @app.post("/v1/capabilities/{capability_id}/autopilot/approvals/{decision_id}")
+    def capability_autopilot_approval(
+        capability_id: str,
+        decision_id: str,
+        body: AutopilotApprovalRequest,
+    ) -> dict[str, Any]:
+        store: AutopilotStore = app.state.autopilot_store
+        run_store: TrainingRunStore = app.state.training_run_store
+        decision = store.load_decision(capability_id, decision_id)
+        if decision is None:
+            raise HTTPException(status_code=404, detail="no such autopilot decision")
+        if decision.approval_status != "pending":
+            raise HTTPException(status_code=409, detail="decision is not pending approval")
+        if not body.approved:
+            decision.approval_status = "rejected"
+            decision.approval_note = body.note or ""
+            decision.outcome = "rejected"
+            store.save_decision(decision)
+            return {"capability_id": capability_id, "decision": decision.as_dict()}
+        if decision.action != "promote_adapter" or not decision.target_id:
+            raise HTTPException(status_code=409, detail="decision cannot be approved")
+        run = run_store.load(decision.target_id)
+        if run is None or run.capability_id != capability_id:
+            raise HTTPException(status_code=404, detail="no such run")
+        if not run_has_served_validation(run):
+            raise HTTPException(
+                status_code=409,
+                detail=served_validation_error_detail(run) or "served validation has not passed",
+            )
+        policy = autopilot_policy(capability_id)
+        cooldown_remaining = promotion_cooldown_remaining(capability_id, policy)
+        if cooldown_remaining > 0:
+            decision.outcome = "blocked"
+            decision.approval_status = "blocked"
+            decision.reasons.append(f"promotion cooldown active for {cooldown_remaining}s")
+            store.save_decision(decision)
+            raise HTTPException(
+                status_code=409,
+                detail=f"promotion cooldown active for {cooldown_remaining}s",
+            )
+        result = promote_run_for_autopilot(
+            capability_id,
+            run,
+            reason="autopilot approval",
+            decision_id=decision.id,
+        )
+        decision.approval_status = "approved"
+        decision.approval_note = body.note or ""
+        decision.approved_at = _now_iso()
+        decision.outcome = "complete"
+        decision.result = result
+        store.save_decision(decision)
+        return {**result, "decision": decision.as_dict()}
+
+    @app.post("/v1/capabilities/{capability_id}/rollback")
+    def capability_rollback(capability_id: str, body: RollbackRequest) -> dict[str, Any]:
+        capability_store: CapabilityStore = app.state.capability_store
+        if not capability_store.exists(capability_id):
+            raise HTTPException(status_code=404, detail="no such capability")
+        adapter_store: AdapterPointerStore = app.state.adapter_pointer_store
+        store: AutopilotStore = app.state.autopilot_store
+        policy = autopilot_policy(capability_id)
+        mode = body.mode or policy.rollback_mode
+        previous_active = adapter_store.get(capability_id)
+        if previous_active is None:
+            decision = store.append_decision(
+                capability_id,
+                trigger="rollback",
+                policy_version=policy.version,
+                action="rollback",
+                outcome="skipped",
+                reasons=["no active adapter to roll back"],
+                input_counts=autopilot_counts(capability_id, policy=policy),
+                result={"mode": mode, "reason": body.reason},
+            )
+            return {
+                "capability_id": capability_id,
+                "status": "skipped",
+                "decision": decision.as_dict(),
+            }
+        if mode == "restore_previous":
+            restore = store.previous_adapter(capability_id)
+            if restore is None:
+                decision = store.append_decision(
+                    capability_id,
+                    trigger="rollback",
+                    policy_version=policy.version,
+                    action="rollback",
+                    outcome="blocked",
+                    reasons=["no previous active adapter to restore"],
+                    input_counts=autopilot_counts(capability_id, policy=policy),
+                    result={"mode": mode, "reason": body.reason},
+                )
+                return {
+                    "capability_id": capability_id,
+                    "status": "blocked",
+                    "decision": decision.as_dict(),
+                }
+            adapter_store._path(capability_id).write_text(json.dumps(restore, indent=2))  # noqa: SLF001
+            current = adapter_store.get(capability_id)
+        else:
+            adapter_store.clear(capability_id)
+            current = None
+        history = store.record_adapter_history(
+            capability_id,
+            previous=previous_active,
+            current=current,
+            reason=body.reason,
+        )
+        decision = store.append_decision(
+            capability_id,
+            trigger="rollback",
+            policy_version=policy.version,
+            action="rollback",
+            outcome="complete",
+            input_counts=autopilot_counts(capability_id, policy=policy),
+            result={"mode": mode, "reason": body.reason, "history_id": history["id"]},
+        )
+        return {
+            "capability_id": capability_id,
+            "status": "rolled_back",
+            "active": current,
+            "decision": decision.as_dict(),
         }
 
     @app.post("/v1/capabilities/{capability_id}/cluster-run")
@@ -1570,67 +3630,7 @@ def create_app() -> FastAPI:
     @app.post("/v1/training-runs", status_code=202)
     async def training_runs_create(body: CreateTrainingRun) -> dict[str, Any]:
         """Create a queued training run and hand execution to the orchestrator."""
-        capability_store: CapabilityStore = app.state.capability_store
-        dataset_store: DatasetStore = app.state.dataset_store
-        run_store: TrainingRunStore = app.state.training_run_store
-
-        try:
-            _spec = capability_store.get(body.capability_id)
-        except CapabilityNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=f"no such capability: {exc}") from exc
-
-        try:
-            recipe = recipe_by_id(body.recipe_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"no such recipe: {exc}") from exc
-
-        dataset_path = dataset_store.resolve_path(body.dataset_id)
-        if dataset_path is None:
-            raise HTTPException(status_code=404, detail=f"no such dataset: {body.dataset_id}")
-        queue = require_job_queue()
-
-        run_id = f"run_{ULID()}"
-        now = _now_iso()
-        run = TrainingRun(
-            id=run_id,
-            capability_id=body.capability_id,
-            recipe_id=recipe.id,
-            dataset_id=body.dataset_id,
-            dataset_path=str(dataset_path),
-            status="queued",
-            created_at=now,
-            updated_at=now,
-            artifact=None,
-            baseline=dict(body.baseline or {}),
-            candidate={},
-            allow_backend_fallback=body.allow_backend_fallback,
-        )
-        run_store.save(run)
-
-        job = create_job(
-            job_type="training",
-            capability_id=run.capability_id,
-            dataset_id=run.dataset_id,
-            run_id=run.id,
-            max_retries=0,
-            retry_payload={"function": "run_training_recipe", "kwargs": {"run_id": run.id}},
-        )
-        job.retry_payload = {
-            "function": "run_training_recipe",
-            "kwargs": {"run_id": run.id, "job_id": job.id},
-        }
-        app.state.job_store.save(job)
-
-        try:
-            await queue.enqueue_job("run_training_recipe", run_id=run.id, job_id=job.id)
-        except Exception as exc:
-            app.state.job_store.fail(job.id, error=f"queue enqueue failed: {exc}")
-            run.status = "failed"
-            run.error = f"queue enqueue failed: {exc}"
-            run.updated_at = _now_iso()
-            run_store.save(run)
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-
+        run = await queue_training_run(body)
         return _run_to_dict(run)
 
     @app.get("/v1/training-runs")
@@ -1817,6 +3817,7 @@ def create_app() -> FastAPI:
         provider = ""
         model = ""
         outputs: list[str] = []
+        validation_rows: list[dict[str, Any]] = []
         adapter_run_id = ""
         adapter_capability_id = ""
         routing_mode = ""
@@ -1890,6 +3891,28 @@ def create_app() -> FastAPI:
                 )
                 scores = await engine.evaluate_trace(trace, spec)
                 all_scores.extend(scores)
+                row_failed = bool(proof_errors) or any(not score.passed for score in scores)
+                validation_rows.append(
+                    {
+                        "replay_trace_id": row.trace_id,
+                        "trace_id": trace.trace_id,
+                        "input": row.input,
+                        "context": row.context or "",
+                        "baseline_output": row.baseline_output,
+                        "expected_candidate_output": row.candidate_output,
+                        "adapted_output": output_text,
+                        "scores": [score.as_dict() for score in scores],
+                        "adapter_proof": {
+                            "provider": provider,
+                            "model": model,
+                            "adapter_run_id": adapter_run_id,
+                            "adapter_capability_id": adapter_capability_id,
+                            "routing_mode": routing_mode,
+                        },
+                        "proof_errors": proof_errors,
+                        "verdict": "failed" if row_failed else "passed",
+                    }
+                )
                 if proof_errors or any(not score.passed for score in scores):
                     failures.append(
                         {
@@ -1919,6 +3942,7 @@ def create_app() -> FastAPI:
                 "adapter_capability_id": adapter_capability_id,
                 "routing_mode": routing_mode,
                 "outputs": outputs,
+                "rows": validation_rows,
                 "failures": failures,
                 "started_at": started_at,
                 "finished_at": finished_at,
@@ -1946,6 +3970,7 @@ def create_app() -> FastAPI:
                 "adapter_capability_id": adapter_capability_id or run.capability_id,
                 "routing_mode": routing_mode,
                 "outputs": outputs,
+                "rows": validation_rows,
                 "failures": [{"error": str(exc)}],
                 "started_at": started_at,
                 "finished_at": finished_at,
@@ -1962,57 +3987,7 @@ def create_app() -> FastAPI:
     async def training_runs_served_validation(
         run_id: str, body: ServedValidationRequest
     ) -> dict[str, Any]:
-        run_store: TrainingRunStore = app.state.training_run_store
-        replay_store: ReplaySetStore = app.state.replay_set_store
-        run = run_store.load(run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail=f"no such training run: {run_id}")
-        replay_set = replay_store.load(body.replay_set_id)
-        if replay_set is None or replay_set.capability_id != run.capability_id:
-            raise HTTPException(status_code=404, detail=f"no such replay set: {body.replay_set_id}")
-        queue = require_job_queue()
-
-        retry_payload: dict[str, Any] = {
-            "function": "run_served_validation",
-            "kwargs": {"run_id": run.id, "replay_set_id": body.replay_set_id},
-        }
-        job = create_job(
-            job_type="served_validation",
-            capability_id=run.capability_id,
-            run_id=run.id,
-            replay_set_id=body.replay_set_id,
-            max_retries=1,
-            retry_payload=retry_payload,
-        )
-        retry_payload["kwargs"]["job_id"] = job.id
-        job.retry_payload = retry_payload
-        app.state.job_store.save(job)
-
-        run.status = "validation-queued"
-        run.error = None
-        run.served_validation = {
-            "status": "queued",
-            "replay_set_id": body.replay_set_id,
-            "job_id": job.id,
-            "queued_at": _now_iso(),
-        }
-        run.updated_at = _now_iso()
-        run_store.save(run)
-
-        try:
-            await queue.enqueue_job(
-                "run_served_validation",
-                run_id=run.id,
-                replay_set_id=body.replay_set_id,
-                job_id=job.id,
-            )
-        except Exception as exc:
-            app.state.job_store.fail(job.id, error=f"queue enqueue failed: {exc}")
-            run.status = "validation-failed"
-            run.error = f"queue enqueue failed: {exc}"
-            run.updated_at = _now_iso()
-            run_store.save(run)
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        run = await queue_served_validation(run_id, body.replay_set_id)
         return _run_to_dict(run)
 
     @app.post("/internal/training-runs/{run_id}/served-validation/run")
@@ -2043,6 +4018,7 @@ def create_app() -> FastAPI:
         capability_store: CapabilityStore = app.state.capability_store
         run_store: TrainingRunStore = app.state.training_run_store
         adapter_store: AdapterPointerStore = app.state.adapter_pointer_store
+        autopilot_store: AutopilotStore = app.state.autopilot_store
 
         if not capability_store.exists(capability_id):
             raise HTTPException(status_code=404, detail="no such capability")
@@ -2074,12 +4050,19 @@ def create_app() -> FastAPI:
                 or "run cannot be activated until served validation passes",
             )
 
+        previous = adapter_store.get(capability_id)
         adapter_store.set_active(
             capability_id,
             run_id=run.id,
             adapter_dir=str(run.artifact.get("adapter_dir", "")),
             baseline=run.baseline,
             candidate=run.candidate,
+        )
+        autopilot_store.record_adapter_history(
+            capability_id,
+            previous=previous,
+            current=adapter_store.get(capability_id),
+            reason="manual activation",
         )
         run.status = "promoted"
         run.updated_at = _now_iso()
@@ -2090,9 +4073,16 @@ def create_app() -> FastAPI:
     def capability_deactivate(capability_id: str) -> Response:
         """Clear the active adapter pointer (revert to base model)."""
         adapter_store: AdapterPointerStore = app.state.adapter_pointer_store
-        path = adapter_store._path(capability_id)  # noqa: SLF001
-        if path.exists():
-            path.unlink()
+        autopilot_store: AutopilotStore = app.state.autopilot_store
+        previous = adapter_store.get(capability_id)
+        adapter_store.clear(capability_id)
+        if previous is not None:
+            autopilot_store.record_adapter_history(
+                capability_id,
+                previous=previous,
+                current=None,
+                reason="manual clear",
+            )
         return Response(status_code=204)
 
     @app.post("/v1/capabilities/{capability_id}/ab-compare")
@@ -2302,6 +4292,12 @@ class SynthesizeRequest(BaseModel):
     generate_missing: bool = True
 
 
+class FailureReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["needs_correction", "not_useful"]
+    note: str | None = None
+
+
 class CreateTrainingRun(BaseModel):
     model_config = ConfigDict(extra="forbid")
     capability_id: str
@@ -2331,6 +4327,48 @@ class ServedValidationRunRequest(BaseModel):
 class ActivateRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     run_id: str
+
+
+class GuidedActionExecuteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    approved: bool = False
+
+
+class AutopilotPolicyUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool | None = None
+    min_corrected_failures: int | None = None
+    min_cluster_size: int | None = None
+    allowed_training_recipes: list[str] | None = None
+    auto_generate_corrections: bool | None = None
+    allow_generated_corrections: bool | None = None
+    auto_create_dataset: bool | None = None
+    auto_start_training: bool | None = None
+    auto_run_served_validation: bool | None = None
+    auto_promote: bool | None = None
+    require_promotion_approval: bool | None = None
+    allow_dry_run_fallback: bool | None = None
+    require_served_validation: bool | None = None
+    max_training_runs_per_day: int | None = None
+    promotion_cooldown_seconds: int | None = None
+    rollback_mode: Literal["disable_current", "restore_previous"] | None = None
+
+
+class AutopilotRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    trigger: str = "manual"
+
+
+class AutopilotApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    approved: bool
+    note: str | None = None
+
+
+class RollbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str
+    mode: Literal["disable_current", "restore_previous"] | None = None
 
 
 class UpdateSettingsRequest(BaseModel):

@@ -98,3 +98,8 @@ class AdapterPointerStore:
         if not path.exists():
             return None
         return json.loads(path.read_text())
+
+    def clear(self, capability_id: str) -> None:
+        path = self._path(capability_id)
+        if path.exists():
+            path.unlink()

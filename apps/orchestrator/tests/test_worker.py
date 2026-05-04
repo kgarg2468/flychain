@@ -153,6 +153,52 @@ async def test_run_training_recipe_updates_run(
 
 
 @pytest.mark.asyncio
+async def test_run_training_recipe_triggers_autopilot_after_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("FLYCHAIN_DATA_DIR", str(tmp_path / "flychain-data"))
+    data_dir = default_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    dataset_path = data_dir / "datasets" / "groundedness" / "demo.jsonl"
+    dataset_path.parent.mkdir(parents=True, exist_ok=True)
+    dataset_path.write_text(json.dumps({"prompt": "x", "completion": "y"}) + "\n")
+    run = TrainingRun(
+        id="run_queued",
+        capability_id="groundedness",
+        recipe_id="sft-mlx-lora",
+        dataset_id="ds_demo",
+        dataset_path=str(dataset_path),
+        status="queued",
+        created_at="2026-04-22T00:00:00+00:00",
+        updated_at="2026-04-22T00:00:00+00:00",
+    )
+    TrainingRunStore(data_dir / "runs").save(run)
+
+    class _Artifact:
+        def as_dict(self) -> dict[str, Any]:
+            return {"adapter_dir": str(data_dir / "runs" / run.id / "artifacts"), "dry_run": True}
+
+    class _Backend:
+        def run(self, **_: Any) -> _Artifact:
+            return _Artifact()
+
+    calls: list[dict[str, str]] = []
+
+    async def _fake_trigger(ctx: dict, *, capability_id: str, trigger: str) -> None:
+        calls.append({"capability_id": capability_id, "trigger": trigger})
+
+    monkeypatch.setattr(
+        "flychain_orchestrator.worker.select_backend",
+        lambda backend_name, allow_fallback=False: _Backend(),
+    )
+    monkeypatch.setattr("flychain_orchestrator.worker.trigger_autopilot", _fake_trigger, raising=False)
+
+    await run_training_recipe({}, run_id=run.id)
+
+    assert calls == [{"capability_id": "groundedness", "trigger": "training_completed"}]
+
+
+@pytest.mark.asyncio
 async def test_apply_promotion_gate_updates_run_and_pointer(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

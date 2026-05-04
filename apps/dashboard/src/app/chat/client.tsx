@@ -10,6 +10,7 @@ import {
   type ChatCompletionResponse,
   type ChatCompletionUsage,
   type ChatMessage,
+  type TraceEvalResponse,
 } from '@/lib/gateway';
 
 const DEFAULT_MODEL = 'local-ollama:llama3.2:3b';
@@ -24,7 +25,10 @@ interface TranscriptMessage {
   usage?: ChatCompletionUsage;
   latencyMs?: number;
   projectId?: string;
+  model?: string;
   activeAdapter?: ChatCompletionResult['activeAdapter'];
+  capabilityIds?: string[];
+  evalResult?: TraceEvalResponse | null;
 }
 
 export function ChatClient({
@@ -80,6 +84,16 @@ export function ChatClient({
         capabilityIds: selectedCapabilityIds,
         tags,
       });
+      const traceId = result.traceId ?? result.response.id ?? null;
+      const evalResult =
+        traceId && selectedCapabilityIds[0]
+          ? await gateway.traceEvals(traceId, selectedCapabilityIds[0]).catch(() => ({
+              trace_id: traceId,
+              capability_id: selectedCapabilityIds[0],
+              eval_status: 'pending',
+              scores: [],
+            }))
+          : null;
       const responseContent = completionContent(result.response);
       setMessages((current) => [
         ...current,
@@ -87,12 +101,15 @@ export function ChatClient({
           id: `model-${Date.now()}`,
           role: 'assistant',
           content: responseContent || '(empty response)',
-          traceId: result.traceId ?? result.response.id ?? null,
+          traceId,
           usage: result.response.usage,
           latencyMs:
             typeof result.response.latency_ms === 'number' ? result.response.latency_ms : undefined,
           projectId: normalizedProject,
+          model: result.response.model ?? model,
           activeAdapter: result.activeAdapter,
+          capabilityIds: selectedCapabilityIds,
+          evalResult,
         },
       ]);
     } catch (e) {
@@ -308,6 +325,26 @@ function MessageBubble({ message }: { message: TranscriptMessage }) {
             </span>
           ) : null}
           {message.activeAdapter?.provider ? <span>{message.activeAdapter.provider}</span> : null}
+          {message.activeAdapter?.model ? <span>{message.activeAdapter.model}</span> : null}
+          {!message.activeAdapter?.model && message.model ? <span>{message.model}</span> : null}
+          {message.activeAdapter?.capabilityId ? (
+            <span className="font-mono">
+              Adapter capability {message.activeAdapter.capabilityId}
+            </span>
+          ) : null}
+          {(message.capabilityIds ?? []).map((capabilityId) => (
+            <span key={capabilityId} className="font-mono">
+              {capabilityId}
+            </span>
+          ))}
+          {message.evalResult ? (
+            <span className="rounded-full bg-neutral-100 px-2 py-0.5 font-medium text-neutral-700">
+              Eval {message.evalResult.eval_status}
+            </span>
+          ) : null}
+          {message.evalResult?.scores[0]?.evaluator_source ? (
+            <span className="font-mono">{message.evalResult.scores[0].evaluator_source}</span>
+          ) : null}
           <Link
             href={`/traces?project_id=${encodeURIComponent(message.projectId ?? DEFAULT_PROJECT)}`}
             className="font-medium text-neutral-900 hover:underline"

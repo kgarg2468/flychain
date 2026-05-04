@@ -5,7 +5,10 @@ import {
 } from './workspace-client';
 import {
   gateway,
+  type AutopilotStatusResponse,
   type CapabilitySpec,
+  type FlywheelSnapshot,
+  type GuidedActionsResponse,
   type JobRow,
   type SettingsPayload,
   type TraceListResponse,
@@ -59,32 +62,45 @@ async function loadSelectedCapability(
   if (!id) return null;
   try {
     const spec = await gateway.getCapability(id);
-    const [scorecard, clusters, datasets, runs, failures, replaySets, activeAdapter, recipes] =
-      await Promise.all([
-        gateway.scorecard(id).catch(() => null),
-        gateway.clusters(id).catch(() => null),
-        gateway
-          .datasets(id)
-          .then((result) => result.datasets)
-          .catch(() => []),
-        gateway
-          .trainingRuns(id)
-          .then((result) => result.runs)
-          .catch(() => []),
-        gateway
-          .failures(id)
-          .then((result) => result.failures)
-          .catch(() => []),
-        gateway
-          .replaySets(id)
-          .then((result) => result.replay_sets)
-          .catch(() => []),
-        gateway.activeAdapter(id).catch(() => null),
-        gateway
-          .recipes()
-          .then((result) => result.recipes)
-          .catch(() => []),
-      ]);
+    const [
+      scorecard,
+      clusters,
+      datasets,
+      runs,
+      failures,
+      replaySets,
+      activeAdapter,
+      recipes,
+      guidedActions,
+      autopilot,
+    ] = await Promise.all([
+      gateway.scorecard(id).catch(() => null),
+      gateway.clusters(id).catch(() => null),
+      gateway
+        .datasets(id)
+        .then((result) => result.datasets)
+        .catch(() => []),
+      gateway
+        .trainingRuns(id)
+        .then((result) => result.runs)
+        .catch(() => []),
+      gateway
+        .failures(id)
+        .then((result) => result.failures)
+        .catch(() => []),
+      gateway
+        .replaySets(id)
+        .then((result) => result.replay_sets)
+        .catch(() => []),
+      gateway.activeAdapter(id).catch(() => null),
+      gateway
+        .recipes()
+        .then((result) => result.recipes)
+        .catch(() => []),
+      gateway.guidedActions(id).catch((): GuidedActionsResponse | null => null),
+      gateway.autopilotStatus(id).catch((): AutopilotStatusResponse | null => null),
+    ]);
+    const flywheel: FlywheelSnapshot | null = await gateway.flywheel(id).catch(() => null);
 
     return {
       spec,
@@ -96,6 +112,9 @@ async function loadSelectedCapability(
       replaySets,
       activeAdapter,
       recipes,
+      flywheel,
+      guidedActions,
+      autopilot,
     };
   } catch {
     return null;

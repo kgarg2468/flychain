@@ -78,6 +78,8 @@ class TraceStore:
                     query_limit=0,
                 )
                 client.ping()
+                self._ensure_eval_score_columns(client)
+                self._ensure_feedback_columns(client)
                 self._client = client
             except Exception as exc:  # pragma: no cover - depends on env
                 logger.warning(
@@ -93,6 +95,42 @@ class TraceStore:
             if client is not None:
                 with contextlib.suppress(Exception):  # pragma: no cover
                     client.close()
+
+    def _ensure_eval_score_columns(self, client: Client) -> None:
+        try:
+            columns = {row[0] for row in client.query("DESCRIBE TABLE eval_scores").result_rows}
+            if "evaluator_type" not in columns:
+                client.command(
+                    "ALTER TABLE eval_scores "
+                    "ADD COLUMN IF NOT EXISTS evaluator_type LowCardinality(String) "
+                    "DEFAULT 'llm_judge' AFTER judge_model"
+                )
+            if "evaluator_source" not in columns:
+                client.command(
+                    "ALTER TABLE eval_scores "
+                    "ADD COLUMN IF NOT EXISTS evaluator_source LowCardinality(String) "
+                    "DEFAULT judge_model AFTER evaluator_type"
+                )
+        except Exception as exc:  # pragma: no cover - depends on ClickHouse state
+            logger.warning("ClickHouse eval_scores migration check failed: %s", exc)
+
+    def _ensure_feedback_columns(self, client: Client) -> None:
+        try:
+            columns = {row[0] for row in client.query("DESCRIBE TABLE feedback").result_rows}
+            if "correction_source" not in columns:
+                client.command(
+                    "ALTER TABLE feedback "
+                    "ADD COLUMN IF NOT EXISTS correction_source LowCardinality(String) "
+                    "DEFAULT 'human' AFTER corrected_response"
+                )
+            if "correction_metadata" not in columns:
+                client.command(
+                    "ALTER TABLE feedback "
+                    "ADD COLUMN IF NOT EXISTS correction_metadata String "
+                    "DEFAULT '' AFTER correction_source"
+                )
+        except Exception as exc:  # pragma: no cover - depends on ClickHouse state
+            logger.warning("ClickHouse feedback migration check failed: %s", exc)
 
     # -- writes ----------------------------------------------------------
 
@@ -138,6 +176,8 @@ class TraceStore:
         score: int,
         comment: str,
         corrected_response: str,
+        correction_source: str = "human",
+        correction_metadata: dict[str, Any] | None = None,
     ) -> None:
         row = {
             "feedback_id": feedback_id,
@@ -147,6 +187,8 @@ class TraceStore:
             "thumb": thumb,
             "comment": comment,
             "corrected_response": corrected_response,
+            "correction_source": correction_source or "human",
+            "correction_metadata": json.dumps(correction_metadata or {}),
             "ts": datetime.now(UTC),
         }
         with self._lock:
@@ -239,14 +281,18 @@ class TraceStore:
         return rows[offset : offset + limit], total
 
     def list_feedback(self) -> list[dict[str, Any]]:
-        return self._merge_rows(
+        rows = self._merge_rows(
             persisted=self._query_rows(
                 "SELECT feedback_id, trace_id, project_id, score, thumb, comment, "
-                "corrected_response, ts FROM feedback"
+                "corrected_response, correction_source, correction_metadata, ts FROM feedback"
             ),
             buffered=self.buffered_feedback(),
             key=lambda row: row["feedback_id"],
         )
+        for row in rows:
+            row.setdefault("correction_source", "human")
+            row.setdefault("correction_metadata", "")
+        return rows
 
     # -- internals -------------------------------------------------------
 
@@ -436,6 +482,8 @@ class TraceStore:
                             r["thumb"],
                             r["comment"],
                             r["corrected_response"],
+                            r.get("correction_source", "human"),
+                            r.get("correction_metadata", ""),
                             r["ts"],
                         ]
                         for r in rows
@@ -448,6 +496,8 @@ class TraceStore:
                         "thumb",
                         "comment",
                         "corrected_response",
+                        "correction_source",
+                        "correction_metadata",
                         "ts",
                     ],
                 )

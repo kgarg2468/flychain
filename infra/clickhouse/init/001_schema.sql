@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS flychain.feedback (
     thumb           Enum8('up' = 1, 'down' = -1, 'none' = 0),
     comment         String CODEC(ZSTD(3)),
     corrected_response String CODEC(ZSTD(3)),
+    correction_source LowCardinality(String) DEFAULT 'human',
+    correction_metadata String DEFAULT '',
     ts              DateTime64(3, 'UTC')
 )
 ENGINE = MergeTree

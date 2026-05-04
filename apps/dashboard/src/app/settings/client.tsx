@@ -105,8 +105,36 @@ export function SettingsClient({ initial }: { initial: SettingsPayload }) {
           <Row label="Environment" value={initial.runtime?.env ?? 'local'} />
           <Row label="Data dir" value={initial.runtime?.data_dir ?? '-'} mono />
           <Row label="Ollama URL" value={initial.runtime?.ollama_url ?? '-'} mono />
+          <Row label="MLX server URL" value={initial.runtime?.mlx_server_url ?? '-'} mono />
+          <Row label="ClickHouse URL" value={initial.runtime?.clickhouse_url ?? '-'} mono />
           <Row label="Redis URL" value={initial.runtime?.redis_url ?? '-'} mono />
         </dl>
+        {initial.runtime?.health?.length ? (
+          <div className="mt-6">
+            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-neutral-400">
+              Component health
+            </div>
+            <div className="mt-3 divide-y divide-neutral-100 border-y border-neutral-100">
+              {initial.runtime.health.map((component) => (
+                <div
+                  key={component.name}
+                  className="grid gap-2 py-3 text-sm sm:grid-cols-[140px_90px_1fr]"
+                >
+                  <div className="font-medium text-neutral-800">{component.name}</div>
+                  <div>
+                    <span className={healthStatusClass(component.status)}>{component.status}</span>
+                  </div>
+                  <div className="min-w-0 text-xs text-neutral-500">
+                    {component.target ? (
+                      <div className="break-all font-mono">{component.target}</div>
+                    ) : null}
+                    {component.detail ? <div>{component.detail}</div> : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
         <p className="mt-6 text-sm leading-6 text-neutral-500">
           Secrets remain env-managed. This page only edits non-secret local knobs stored under the
           shared FlyChain data directory.
@@ -148,4 +176,14 @@ function Row({ label, value, mono = false }: { label: string; value: string; mon
       <dd className={mono ? 'font-mono text-neutral-700' : 'text-neutral-700'}>{value}</dd>
     </div>
   );
+}
+
+function healthStatusClass(status: string): string {
+  if (status === 'ok') {
+    return 'inline-flex w-fit bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700';
+  }
+  if (status === 'down' || status === 'degraded') {
+    return 'inline-flex w-fit bg-red-50 px-2 py-1 text-xs font-medium text-red-700';
+  }
+  return 'inline-flex w-fit bg-neutral-100 px-2 py-1 text-xs font-medium text-neutral-700';
 }

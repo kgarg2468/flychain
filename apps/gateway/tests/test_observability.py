@@ -12,9 +12,11 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from flychain_capability_compiler import Cluster, ClusteringResult, SynthesizedDataset
 from flychain_gateway import main as gw_main
 from flychain_gateway.main import create_app
 from flychain_gateway.schemas import TraceRecord
+from flychain_gateway.training_store import TrainingRun
 
 
 class FakeLLM:
@@ -236,6 +238,14 @@ def test_settings_endpoint_is_env_first_and_persists_local_knobs(client: TestCli
     assert body["openai_configured"] is False
     assert body["anthropic_configured"] is False
     assert body["settings"]["judge_model"] == "llama3.2:3b"
+    assert {
+        "Gateway",
+        "Background jobs",
+        "ClickHouse",
+        "Redis",
+        "Ollama",
+        "MLX server",
+    }.issubset({component["name"] for component in body["runtime"]["health"]})
 
     update = client.put(
         "/v1/settings",
@@ -326,3 +336,301 @@ def test_failures_endpoint_derives_trace_eval_and_feedback_state(client: TestCli
     assert failure["corrected_response"] == "Refunds are available for 30 days."
     assert failure["failing_dimensions"] == ["all_claims_supported"]
     assert failure["aggregate_score"] < 1.0
+    assert failure["correction_status"] == "corrected"
+    assert failure["review_status"] == "needs_correction"
+    assert failure["dataset_eligible"] is True
+    assert failure["cluster_ids"] == []
+    assert failure["dimension_results"] == [
+        {
+            "dimension": "all_claims_supported",
+            "score": 0.2,
+            "passed": False,
+            "reason": "unsupported",
+            "evaluator_type": "llm_judge",
+            "evaluator_source": "fake",
+            "ts": failure["dimension_results"][0]["ts"],
+        },
+        {
+            "dimension": "no_material_omissions",
+            "score": 0.8,
+            "passed": True,
+            "reason": "fine",
+            "evaluator_type": "llm_judge",
+            "evaluator_source": "fake",
+            "ts": failure["dimension_results"][1]["ts"],
+        },
+    ]
+
+
+def test_failure_review_marks_not_useful_without_deleting_evidence(client: TestClient) -> None:
+    client.post("/v1/capabilities/from-template", json={"template_id": "groundedness"})
+    store = client.app.state.trace_store
+    asyncio.run(
+        store.insert_trace(
+            TraceRecord(
+                trace_id="trace-review",
+                project_id="proj-a",
+                provider="openai",
+                model="gpt-4o-mini",
+                method="chat.completions",
+                request={"messages": [{"role": "user", "content": "Q"}]},
+                response={"choices": [{"message": {"content": "wrong"}}]},
+                capability_ids=["groundedness"],
+                status="ok",
+            )
+        )
+    )
+    asyncio.run(
+        store.insert_eval_scores(
+            [
+                {
+                    "trace_id": "trace-review",
+                    "project_id": "proj-a",
+                    "capability_id": "groundedness",
+                    "dimension": "all_claims_supported",
+                    "score": 0.0,
+                    "passed": False,
+                    "reason": "bad",
+                    "judge_model": "fake",
+                }
+            ]
+        )
+    )
+
+    review = client.post(
+        "/v1/capabilities/groundedness/failures/trace-review/review",
+        json={"status": "not_useful", "note": "duplicate noisy trace"},
+    )
+
+    assert review.status_code == 200, review.text
+    assert review.json()["status"] == "not_useful"
+    failures = client.get("/v1/capabilities/groundedness/failures").json()["failures"]
+    assert failures[0]["trace_id"] == "trace-review"
+    assert failures[0]["review_status"] == "not_useful"
+    assert failures[0]["dataset_eligible"] is False
+    assert failures[0]["dimension_results"][0]["reason"] == "bad"
+
+
+def test_trace_eval_endpoint_returns_pending_pass_and_fail_states(client: TestClient) -> None:
+    client.post("/v1/capabilities/from-template", json={"template_id": "groundedness"})
+    store = client.app.state.trace_store
+    for trace_id, content in [("trace-pass", "ok"), ("trace-pending", "waiting")]:
+        asyncio.run(
+            store.insert_trace(
+                TraceRecord(
+                    trace_id=trace_id,
+                    project_id="proj-a",
+                    provider="openai",
+                    model="gpt-4o-mini",
+                    method="chat.completions",
+                    request={"messages": [{"role": "user", "content": content}]},
+                    response={"choices": [{"message": {"content": content}}]},
+                    capability_ids=["groundedness"],
+                    status="ok",
+                )
+            )
+        )
+    asyncio.run(
+        store.insert_eval_scores(
+            [
+                {
+                    "trace_id": "trace-pass",
+                    "project_id": "proj-a",
+                    "capability_id": "groundedness",
+                    "dimension": "all_claims_supported",
+                    "score": 1.0,
+                    "passed": True,
+                    "reason": "ok",
+                    "judge_model": "fake",
+                }
+            ]
+        )
+    )
+
+    passed = client.get("/v1/traces/trace-pass/evals?capability_id=groundedness")
+    pending = client.get("/v1/traces/trace-pending/evals?capability_id=groundedness")
+
+    assert passed.status_code == 200, passed.text
+    assert passed.json()["eval_status"] == "passed"
+    assert passed.json()["passed"] is True
+    assert passed.json()["scores"][0]["dimension"] == "all_claims_supported"
+    assert pending.status_code == 200, pending.text
+    assert pending.json()["eval_status"] == "pending"
+    assert pending.json()["scores"] == []
+
+
+def test_capability_flywheel_endpoint_summarizes_full_visibility_loop(
+    client: TestClient,
+) -> None:
+    client.post("/v1/capabilities/from-template", json={"template_id": "groundedness"})
+    store = client.app.state.trace_store
+    for trace_id, output, passed in [
+        ("trace-fail", "Refunds are available for 90 days.", False),
+        ("trace-active", "Refunds are available for 30 days.", True),
+    ]:
+        asyncio.run(
+            store.insert_trace(
+                TraceRecord(
+                    trace_id=trace_id,
+                    project_id="proj-a",
+                    provider="local-mlx" if trace_id == "trace-active" else "openai",
+                    model="mlx-community/Llama-3.2-3B-Instruct-4bit"
+                    if trace_id == "trace-active"
+                    else "gpt-4o-mini",
+                    method="chat.completions",
+                    request={
+                        "messages": [{"role": "user", "content": "What is the refund window?"}],
+                        **(
+                            {"adapters": "/tmp/adapter"}
+                            if trace_id == "trace-active"
+                            else {}
+                        ),
+                    },
+                    response={"choices": [{"message": {"content": output}}]},
+                    capability_ids=["groundedness"],
+                    status="ok",
+                    tags={"task": "rag"},
+                )
+            )
+        )
+        asyncio.run(
+            store.insert_eval_scores(
+                [
+                    {
+                        "trace_id": trace_id,
+                        "project_id": "proj-a",
+                        "capability_id": "groundedness",
+                        "dimension": "all_claims_supported",
+                        "score": 1.0 if passed else 0.2,
+                        "passed": passed,
+                        "reason": "ok" if passed else "unsupported",
+                        "judge_model": "fake",
+                    }
+                ]
+            )
+        )
+    asyncio.run(
+        store.insert_feedback(
+            feedback_id="fb-flywheel",
+            trace_id="trace-fail",
+            project_id="proj-a",
+            thumb="down",
+            score=-2,
+            comment="wrong",
+            corrected_response="Refunds are available for 30 days.",
+        )
+    )
+    client.app.state.cluster_store.save(
+        ClusteringResult(
+            capability_id="groundedness",
+            clusters=[
+                Cluster(
+                    id="groundedness-c0",
+                    capability_id="groundedness",
+                    label="refund window",
+                    size=1,
+                    trace_ids=["trace-fail"],
+                )
+            ],
+            noise_trace_ids=[],
+        )
+    )
+    client.app.state.dataset_store.record(
+        SynthesizedDataset(
+            id="ds_visibility",
+            capability_id="groundedness",
+            cluster_id="groundedness-c0",
+            method="sft",
+            path="/tmp/ds_visibility.jsonl",
+            row_count=1,
+        )
+    )
+    run = TrainingRun(
+        id="run_visibility",
+        capability_id="groundedness",
+        recipe_id="sft-mlx-lora-local-3b",
+        dataset_id="ds_visibility",
+        dataset_path="/tmp/ds_visibility.jsonl",
+        status="promoted",
+        created_at="2026-05-03T00:00:00+00:00",
+        updated_at="2026-05-03T00:01:00+00:00",
+        artifact={"backend": "mlx-lm", "adapter_dir": "/tmp/adapter", "dry_run": False},
+        baseline={"groundedness": 0.2},
+        candidate={"groundedness": 1.0},
+        gate_verdict={"decision": "promote", "reason": "validated"},
+        latest_comparison={
+            "replay_set_id": "replay_visibility",
+            "baseline": {"aggregate_score": 0.2},
+            "candidate": {"aggregate_score": 1.0},
+            "delta": 0.8,
+            "ts": "2026-05-03T00:02:00+00:00",
+        },
+        served_validation={
+            "status": "passed",
+            "aggregate_score": 1.0,
+            "sample_count": 1,
+            "provider": "local-mlx",
+            "model": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+            "adapter_run_id": "run_visibility",
+            "adapter_capability_id": "groundedness",
+            "rows": [
+                {
+                    "replay_trace_id": "trace-fail",
+                    "input": "What is the refund window?",
+                    "baseline_output": "Refunds are available for 90 days.",
+                    "adapted_output": "Refunds are available for 30 days.",
+                    "verdict": "passed",
+                }
+            ],
+        },
+    )
+    client.app.state.training_run_store.save(run)
+    client.app.state.adapter_pointer_store.set_active(
+        "groundedness",
+        run_id="run_visibility",
+        adapter_dir="/tmp/adapter",
+        baseline={"groundedness": 0.2},
+        candidate={"groundedness": 1.0},
+    )
+    job = client.app.state.job_store.create(
+        job_type="served_validation",
+        status="failed",
+        capability_id="groundedness",
+        run_id="run_visibility",
+    )
+    client.app.state.job_store.fail(job.id, error="validation failed")
+
+    resp = client.get("/v1/capabilities/groundedness/flywheel")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["summary"]["total_traces"] == 2
+    assert body["summary"]["evaluated_traces"] == 2
+    assert body["summary"]["failing_traces"] == 1
+    assert body["summary"]["unresolved_failures"] == 0
+    assert body["summary"]["clusters"] == 1
+    assert body["summary"]["datasets"] == 1
+    assert body["summary"]["training_runs"] == 1
+    assert body["summary"]["latest_served_validation"]["status"] == "passed"
+    assert body["summary"]["active_adapter"]["active_run_id"] == "run_visibility"
+    assert body["summary"]["last_adapted_chat"]["trace_id"] == "trace-active"
+    assert [step["id"] for step in body["timeline"]] == [
+        "capture",
+        "evaluate",
+        "fail",
+        "correct",
+        "cluster",
+        "dataset",
+        "train",
+        "validate",
+        "promote",
+        "serve",
+    ]
+    assert body["failures"][0]["dimension_results"][0]["reason"] == "unsupported"
+    assert body["clusters"][0]["correction_coverage"]["corrected"] == 1
+    assert body["clusters"][0]["latest_dataset_id"] == "ds_visibility"
+    assert body["datasets"][0]["training_run_ids"] == ["run_visibility"]
+    assert body["training_runs"][0]["active"] is True
+    assert body["jobs"][0]["status"] == "failed"
+    assert body["before_after"]["baseline_output"] == "Refunds are available for 90 days."
+    assert body["before_after"]["adapted_output"] == "Refunds are available for 30 days."

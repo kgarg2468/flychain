@@ -50,10 +50,22 @@ describe('SettingsClient', () => {
             postgres_url: 'postgresql://localhost:5432',
             redis_url: 'redis://localhost:6379/0',
             data_dir: '/tmp/flychain-data',
+            health: [
+              { name: 'Gateway', status: 'ok' },
+              { name: 'Background jobs', status: 'ok', target: 'redis://localhost:6379/0' },
+              { name: 'ClickHouse', status: 'ok', target: 'http://localhost:8123' },
+              { name: 'Redis', status: 'ok', target: 'redis://localhost:6379/0' },
+              { name: 'Ollama', status: 'ok', target: 'http://localhost:11434' },
+              { name: 'MLX server', status: 'ok', target: 'http://127.0.0.1:8081' },
+            ],
           },
         }}
       />,
     );
+
+    expect(screen.getByText('Component health')).toBeInTheDocument();
+    expect(screen.getByText('Background jobs')).toBeInTheDocument();
+    expect(screen.getByText('MLX server')).toBeInTheDocument();
 
     await user.clear(screen.getByLabelText(/judge model/i));
     await user.type(screen.getByLabelText(/judge model/i), 'llama3.2:3b');

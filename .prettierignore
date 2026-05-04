@@ -10,3 +10,6 @@ __pycache__
 pnpm-lock.yaml
 uv.lock
 plan.md
+final.md
+docs/e2e/*.md
+.flychain-phase*-e2e-*/

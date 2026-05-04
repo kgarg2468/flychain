@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,16 @@ async def shutdown(ctx: dict) -> None:
 async def noop(ctx: dict) -> str:
     """Placeholder task kept for health-checks."""
     return "ok"
+
+
+async def trigger_autopilot(ctx: dict, *, capability_id: str, trigger: str) -> None:
+    settings = ctx.get("settings") or get_settings()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as client:
+        resp = await client.post(
+            f"{settings.gateway_url.rstrip('/')}/v1/capabilities/{capability_id}/autopilot/run",
+            json={"trigger": trigger},
+        )
+        resp.raise_for_status()
 
 
 async def _with_job_timeout(job_store: JobStore, job_id: str | None, awaitable):
@@ -147,6 +158,8 @@ async def run_training_recipe(ctx: dict, *, run_id: str, job_id: str | None = No
     run_store.save(run)
     if job_id:
         job_store.succeed(job_id)
+    with suppress(Exception):
+        await trigger_autopilot(ctx, capability_id=run.capability_id, trigger="training_completed")
     return asdict(run)
 
 
@@ -277,7 +290,15 @@ async def run_served_validation(
             ),
         )
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+    with suppress(Exception):
+        _run_store, run, _data_root = _load_run(run_id)
+        await trigger_autopilot(
+            ctx,
+            capability_id=run.capability_id,
+            trigger="served_validation_completed",
+        )
+    return result
 
 
 def _redis_settings_from_url(url: str) -> RedisSettings:
